@@ -1,215 +1,208 @@
-import { FileText, GitCompare, LoaderCircle, WifiOff } from "lucide-react";
-import { useEffect, useState } from "react";
-
-import { useWorkspaceStore } from "./state/workspace";
-import { DiffViewer } from "./ui/editor/DiffViewer";
-import { MarkdownEditor } from "./ui/editor/MarkdownEditor";
-import { CommandPalette } from "./ui/layout/CommandPalette";
-import { SidebarTree } from "./ui/layout/SidebarTree";
-import { TopBar } from "./ui/layout/TopBar";
-import { XRayDrawer } from "./ui/xray/XRayDrawer";
-
-type WorkspaceView = "editor" | "diff";
+import { useEffect, useState, type DragEvent } from 'react';
+import { Upload, X } from 'lucide-react';
+import { BackupImportModal } from './components/BackupImportModal';
+import { CommandPalette } from './components/CommandPalette';
+import { DiffViewer } from './components/DiffViewer';
+import { GuidedTourBar } from './components/GuidedTourBar';
+import { MarkdownEditor } from './components/MarkdownEditor';
+import { OfflineIndicator } from './components/OfflineIndicator';
+import { SearchModal } from './components/SearchModal';
+import { ShareLinkModal } from './components/ShareLinkModal';
+import { SidebarTree } from './components/SidebarTree';
+import { TopBar } from './components/TopBar';
+import { WorkspaceModal } from './components/WorkspaceModal';
+import { XRayDrawer } from './components/XRayDrawer';
+import { importFromUploadedFiles } from './core/archive/repoArchive';
+import { useWorkspaceStore } from './state/workspace';
 
 export default function App() {
-  const initialize = useWorkspaceStore((state) => state.initialize);
-  const status = useWorkspaceStore((state) => state.status);
-  const error = useWorkspaceStore((state) => state.error);
-  const busy = useWorkspaceStore((state) => state.busy);
-  const diffs = useWorkspaceStore((state) => state.diffs);
-  const fileContents = useWorkspaceStore((state) => state.fileContents);
-  const activePath = useWorkspaceStore((state) => state.activePath);
-  const workingTree = useWorkspaceStore((state) => state.workingTree);
-  const pendingMerge = useWorkspaceStore((state) => state.pendingMerge);
-  const mergeOutcome = useWorkspaceStore((state) => state.mergeOutcome);
-  const activeBranch = useWorkspaceStore((state) => state.activeBranch);
-  const remoteBranch = useWorkspaceStore((state) => state.remoteBranch);
-  const selectFile = useWorkspaceStore((state) => state.selectFile);
-  const newFile = useWorkspaceStore((state) => state.newFile);
-  const deleteFile = useWorkspaceStore((state) => state.deleteFile);
-  const resolveConflict = useWorkspaceStore((state) => state.resolveConflict);
-  const completeMerge = useWorkspaceStore((state) => state.completeMerge);
-  const abortMerge = useWorkspaceStore((state) => state.abortMerge);
-  const [view, setView] = useState<WorkspaceView>("editor");
+  const {
+    initialized,
+    loading,
+    viewMode,
+    notice,
+    initWorkspace,
+    disposeWorkspace,
+    clearNotice,
+    setPaletteOpen,
+    setSearchOpen,
+    setXRayOpen,
+    setWorkspaceModalOpen,
+    setBackupModalOpen,
+    closeShareModal,
+    handleShareHash,
+    importFilesIntoWorkingTree,
+    importArchivePayload,
+    setNotice,
+  } = useWorkspaceStore();
+
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [globalFileDrag, setGlobalFileDrag] = useState(false);
 
   useEffect(() => {
-    void initialize();
-  }, [initialize]);
+    void initWorkspace();
+    return () => {
+      disposeWorkspace();
+    };
+  }, [initWorkspace, disposeWorkspace]);
 
   useEffect(() => {
-    if (pendingMerge) setView("diff");
-  }, [pendingMerge]);
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        setPaletteOpen(false);
+        setWorkspaceModalOpen(false);
+        setBackupModalOpen(false);
+        setSearchOpen(true);
+      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setSearchOpen(false);
+        setWorkspaceModalOpen(false);
+        setBackupModalOpen(false);
+        setPaletteOpen(true);
+      } else if (e.key === 'Escape') {
+        setPaletteOpen(false);
+        setSearchOpen(false);
+        setXRayOpen(false);
+        setWorkspaceModalOpen(false);
+        setBackupModalOpen(false);
+        closeShareModal();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    const onHashChange = () => {
+      void handleShareHash(window.location.hash);
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('hashchange', onHashChange);
+    };
+  }, [
+    setPaletteOpen,
+    setSearchOpen,
+    setXRayOpen,
+    setWorkspaceModalOpen,
+    setBackupModalOpen,
+    closeShareModal,
+    handleShareHash,
+  ]);
 
-  useEffect(() => {
-    if (mergeOutcome?.status === "MERGED_CLEAN") setView("editor");
-  }, [mergeOutcome]);
-
-  if (status === "idle" || status === "loading") {
-    return (
-      <div className="grid min-h-screen place-items-center bg-[#080a0d]">
-        <div className="flex flex-col items-center gap-4">
-          <span className="grid size-10 place-items-center rounded-lg border border-emerald-400/20 bg-emerald-400/10 font-mono text-sm font-semibold text-emerald-300">
-            C
-          </span>
-          <div className="flex items-center gap-2 font-mono text-[11px] text-zinc-500">
-            <LoaderCircle className="size-3.5 animate-spin" aria-hidden />
-            hydrating workspace from IndexedDB…
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  if (status === "error" && diffs.length === 0) {
-    return (
-      <div className="grid min-h-screen place-items-center bg-[#080a0d] px-6">
-        <div className="max-w-md rounded-xl border border-rose-400/20 bg-rose-400/[0.04] p-6">
-          <h1 className="text-sm font-semibold text-rose-200">
-            Workspace failed to initialize
-          </h1>
-          <p className="mt-2 font-mono text-[11px] leading-5 text-rose-200/70">
-            {error}
-          </p>
-          <button
-            type="button"
-            onClick={() => void initialize()}
-            className="mt-4 rounded-md border border-white/10 px-3 py-1.5 font-mono text-[10px] text-zinc-300 hover:border-white/20"
-          >
-            Retry
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  const changed = diffs.filter((diff) => diff.status !== "UNMODIFIED").length;
+  const handleGlobalDrop = async (e: DragEvent<HTMLDivElement>) => {
+    if (!e.dataTransfer?.files || e.dataTransfer.files.length === 0) return;
+    e.preventDefault();
+    setGlobalFileDrag(false);
+    try {
+      const inputs: Array<{ path: string; bytes: Uint8Array }> = [];
+      for (let i = 0; i < e.dataTransfer.files.length; i++) {
+        const f = e.dataTransfer.files[i];
+        const rel =
+          (f as File & { webkitRelativePath?: string }).webkitRelativePath ||
+          f.name;
+        const buf = await f.arrayBuffer();
+        inputs.push({ path: rel, bytes: new Uint8Array(buf) });
+      }
+      const outcome = await importFromUploadedFiles(inputs);
+      if (outcome.kind === 'archive') {
+        await importArchivePayload(outcome.archive, 'new-workspace');
+      } else {
+        importFilesIntoWorkingTree(outcome.files, outcome.skippedCount);
+      }
+    } catch (err) {
+      setNotice({
+        type: 'error',
+        message:
+          err instanceof Error ? err.message : 'Failed to import dropped files.',
+      });
+    }
+  };
 
   return (
-    <div className="flex h-screen flex-col overflow-hidden bg-[#080a0d] text-zinc-200">
-      <TopBar />
+    <div
+      onDragOver={(e) => {
+        if (e.dataTransfer?.types?.includes('Files')) {
+          e.preventDefault();
+          setGlobalFileDrag(true);
+        }
+      }}
+      onDragLeave={(e) => {
+        if (e.currentTarget === e.target) {
+          setGlobalFileDrag(false);
+        }
+      }}
+      onDrop={(e) => void handleGlobalDrop(e)}
+      className="h-screen w-screen overflow-hidden flex flex-col bg-[#0B0D1A] bg-[radial-gradient(ellipse_78%_52%_at_16%_-8%,rgba(139,92,246,0.24),transparent_62%),radial-gradient(ellipse_62%_46%_at_86%_6%,rgba(6,182,212,0.20),transparent_60%),radial-gradient(ellipse_50%_42%_at_10%_94%,rgba(236,72,153,0.14),transparent_62%),radial-gradient(ellipse_48%_40%_at_90%_90%,rgba(16,185,129,0.12),transparent_62%)] text-slate-100 relative"
+    >
+      <TopBar onToggleMobileSidebar={() => setMobileSidebarOpen((v) => !v)} />
+      <GuidedTourBar />
 
-      <div className="flex min-h-0 flex-1">
+      {notice && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`px-4 py-2 text-xs font-medium border-b backdrop-blur-md flex items-center justify-between gap-3 shrink-0 ${
+            notice.type === 'error'
+              ? 'bg-rose-950/65 border-rose-400/40 text-rose-100'
+              : notice.type === 'success'
+                ? 'bg-emerald-950/60 border-emerald-400/40 text-emerald-100'
+                : 'bg-indigo-950/75 border-indigo-300/20 text-indigo-50'
+          }`}
+        >
+          <span>{notice.message}</span>
+          <button
+            type="button"
+            onClick={clearNotice}
+            aria-label="Dismiss notification"
+            className="p-0.5 rounded hover:bg-white/10"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
+      <div className="flex-1 min-h-0 flex relative">
         <SidebarTree
-          diffs={diffs}
-          activePath={activePath}
-          onSelect={(path) => {
-            selectFile(path);
-            setView("editor");
-          }}
-          onNewFile={() => {
-            void newFile();
-            setView("editor");
-          }}
-          onDeleteFile={(path) => void deleteFile(path)}
+          mobileOpen={mobileSidebarOpen}
+          onCloseMobile={() => setMobileSidebarOpen(false)}
         />
 
-        <main className="flex min-w-0 flex-1 flex-col">
-          <div className="flex h-10 shrink-0 items-center gap-1 border-b border-white/[0.06] bg-[#090b0f] px-2">
-            <button
-              type="button"
-              onClick={() => setView("editor")}
-              className={`inline-flex h-7 items-center gap-1.5 rounded-md px-2 font-mono text-[10px] transition ${
-                view === "editor"
-                  ? "bg-white/[0.06] text-zinc-100"
-                  : "text-zinc-500 hover:text-zinc-300"
-              }`}
-            >
-              <FileText className="size-3.5" aria-hidden />
-              Editor
-            </button>
-            <button
-              type="button"
-              onClick={() => setView("diff")}
-              className={`inline-flex h-7 items-center gap-1.5 rounded-md px-2 font-mono text-[10px] transition ${
-                view === "diff"
-                  ? "bg-white/[0.06] text-zinc-100"
-                  : "text-zinc-500 hover:text-zinc-300"
-              }`}
-            >
-              <GitCompare className="size-3.5" aria-hidden />
-              Diff
-              {changed > 0 && (
-                <span className="rounded border border-amber-400/25 bg-amber-400/10 px-1 text-[9px] text-amber-300">
-                  {changed}
-                </span>
-              )}
-            </button>
-
-            <div className="ml-auto flex items-center gap-3 font-mono text-[9px] text-zinc-600">
-              {remoteBranch && remoteBranch !== activeBranch && (
-                <span className="text-sky-300/80">
-                  twin · {remoteBranch}
-                </span>
-              )}
-              <span className="inline-flex items-center gap-1">
-                <WifiOff className="size-3" aria-hidden />
-                offline-ready
-              </span>
+        <main className="flex-1 min-w-0 flex flex-col">
+          {!initialized && loading ? (
+            <div className="flex-1 flex items-center justify-center text-sm text-indigo-200">
+              Hydrating local IndexedDB repository...
             </div>
-          </div>
-
-          {error && (
-            <div className="border-b border-rose-400/20 bg-rose-400/[0.06] px-3 py-1.5 font-mono text-[10px] text-rose-200/90">
-              {error}
-            </div>
+          ) : viewMode === 'diff' ? (
+            <DiffViewer />
+          ) : (
+            <MarkdownEditor />
           )}
-
-          <div className="relative min-h-0 flex-1">
-            {view === "editor" &&
-              (workingTree && activePath ? (
-                <MarkdownEditor
-                  workingTree={workingTree}
-                  path={activePath}
-                />
-              ) : (
-                <div className="grid h-full place-items-center px-6 text-center">
-                  <div>
-                    <FileText
-                      className="mx-auto size-6 text-zinc-600"
-                      aria-hidden
-                    />
-                    <p className="mt-3 text-sm text-zinc-400">
-                      No file selected
-                    </p>
-                    <p className="mt-1 font-mono text-[11px] text-zinc-600">
-                      Choose a file in the sidebar or create a new one.
-                    </p>
-                  </div>
-                </div>
-              ))}
-
-            {view === "diff" && (
-              <DiffViewer
-                diffs={diffs}
-                workingFiles={fileContents}
-                pendingMerge={pendingMerge}
-                busy={busy}
-                onResolve={(path, resolution) =>
-                  void resolveConflict(path, resolution)
-                }
-                onCommitMerge={() => void completeMerge()}
-                onAbortMerge={() => void abortMerge()}
-              />
-            )}
-          </div>
         </main>
-
-        <XRayDrawer />
       </div>
 
-      <footer className="flex h-6 shrink-0 items-center justify-between border-t border-white/[0.06] bg-[#090b0f] px-3 font-mono text-[9px] text-zinc-600">
-        <span>
-          phase 5 / 5 · CRDT working tree + immutable Merkle-DAG
-        </span>
-        <span>
-          {activeBranch ?? "detached"} · {diffs.length} files · {changed} changed
-        </span>
-      </footer>
+      <XRayDrawer />
+      <CommandPalette />
+      <SearchModal />
+      <ShareLinkModal />
+      <WorkspaceModal />
+      <BackupImportModal />
+      <OfflineIndicator />
 
-      <CommandPalette
-        onShowEditor={() => setView("editor")}
-        onShowDiff={() => setView("diff")}
-      />
+      {globalFileDrag && (
+        <div
+          className="fixed inset-0 z-50 bg-[#050611]/75 backdrop-blur-md flex items-center justify-center p-6 pointer-events-none"
+          aria-hidden="true"
+        >
+          <div className="rounded-2xl border-2 border-dashed border-cyan-300/75 bg-[#121530]/90 px-10 py-8 text-center space-y-2 shadow-2xl">
+            <Upload className="w-8 h-8 mx-auto text-cyan-300" />
+            <div className="font-display text-base font-semibold text-white">
+              Drop to Import into Chronicle
+            </div>
+            <p className="text-xs text-indigo-200">
+              Supports .zip / .json repository backups and Markdown files
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

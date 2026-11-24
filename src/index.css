@@ -1,29 +1,133 @@
 @import "tailwindcss";
 
-@theme {
-  --font-sans:
-    ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
-    sans-serif;
-  --font-mono:
-    ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, "Liberation Mono",
-    monospace;
+@layer base {
+  :root {
+    --font-display: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+    --font-sans: "DM Sans", ui-sans-serif, system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    font-family: var(--font-sans);
+    background-color: #0b0d1a;
+    color: #f8fafc;
+  }
+
+  h1,
+  h2,
+  h3,
+  .font-display {
+    font-family: var(--font-display);
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
 }
 
-:root {
-  color-scheme: dark light;
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
 }
 
-html,
-body,
-#root {
-  min-height: 100%;
+.glass-panel {
+  background: linear-gradient(
+    180deg,
+    rgba(24, 28, 64, 0.72) 0%,
+    rgba(16, 19, 46, 0.68) 100%
+  );
+  backdrop-filter: blur(22px) saturate(165%);
+  -webkit-backdrop-filter: blur(22px) saturate(165%);
+  box-shadow: inset 0 1px 0 rgba(196, 181, 253, 0.14);
 }
 
-body {
-  margin: 0;
-  background-color: #080a0d;
-  color: #e4e4e7;
-  font-family: var(--font-sans);
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
+.glass-topbar {
+  background: linear-gradient(
+    90deg,
+    rgba(26, 24, 66, 0.74) 0%,
+    rgba(17, 23, 56, 0.68) 52%,
+    rgba(15, 28, 56, 0.72) 100%
+  );
+  backdrop-filter: blur(26px) saturate(185%);
+  -webkit-backdrop-filter: blur(26px) saturate(185%);
+  box-shadow:
+    0 8px 34px rgba(4, 6, 22, 0.52),
+    inset 0 1px 0 rgba(167, 139, 250, 0.22);
+}
+
+.glass-sidebar {
+  background: linear-gradient(
+    180deg,
+    rgba(21, 23, 56, 0.66) 0%,
+    rgba(13, 16, 40, 0.58) 100%
+  );
+  backdrop-filter: blur(24px) saturate(175%);
+  -webkit-backdrop-filter: blur(24px) saturate(175%);
+  box-shadow:
+    6px 0 34px rgba(4, 6, 22, 0.48),
+    inset 0 1px 0 rgba(167, 139, 250, 0.14),
+    inset -1px 0 0 rgba(129, 140, 248, 0.12);
+}
+
+.glass-drawer {
+  background: linear-gradient(
+    180deg,
+    rgba(22, 24, 58, 0.78) 0%,
+    rgba(13, 16, 42, 0.70) 100%
+  );
+  backdrop-filter: blur(36px) saturate(190%);
+  -webkit-backdrop-filter: blur(36px) saturate(190%);
+  box-shadow:
+    -16px 0 64px rgba(3, 5, 20, 0.76),
+    inset 1px 0 0 rgba(167, 139, 250, 0.22),
+    inset 0 1px 0 rgba(103, 232, 249, 0.14);
+}
+
+.glass-surface {
+  background: linear-gradient(
+    180deg,
+    rgba(129, 140, 248, 0.085) 0%,
+    rgba(30, 41, 82, 0.28) 100%
+  );
+  backdrop-filter: blur(14px) saturate(160%);
+  -webkit-backdrop-filter: blur(14px) saturate(160%);
+  box-shadow: inset 0 1px 0 rgba(196, 181, 253, 0.12);
+}
+
+/* Subtle twilight scrollbars for workspace panes */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(167, 139, 250, 0.28);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(34, 211, 238, 0.45);
+}
+
+/* CodeMirror host containment */
+.cm-editor {
+  height: 100%;
+  outline: none !important;
+  font-family: var(--font-mono);
+  font-size: 13.75px;
+  line-height: 1.72;
+}
+
+.cm-scroller {
+  overflow: auto;
+  font-family: var(--font-mono);
 }

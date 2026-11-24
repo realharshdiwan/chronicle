@@ -1,540 +1,1880 @@
-/**
- * Reactive workspace bridge.
- *
- * Owns the browser services (IndexedDB CAS, Yjs working tree, BroadcastChannel
- * relay, Repository) and exposes a small Zustand store to the UI. All mutations
- * go through the Git-semantics Repository so checkout, merge, and dirty-tree
- * protection stay identical to the core test suite.
- */
-
-import { create } from "zustand";
-import { clearDocument } from "y-indexeddb";
-
-import { IndexedDBObjectStorage } from "../core/cas/ObjectStore";
-import { computeStorageTelemetry } from "../core/cas/telemetry";
-import { DEFAULT_PERSISTENCE_NAME, WorkingTreeDoc } from "../core/crdt/WorkingTreeDoc";
-import { TabSyncBridge } from "../core/crdt/TabSyncBridge";
-import { resolveConflictMarkers } from "../core/merge/conflictParser";
-import type { ConflictResolution } from "../core/merge/conflictParser";
-import { DEMO_MAIN_BRANCH, seedDemoRepo } from "../core/seed/seedDemoRepo";
-import { getCommit, getCommitHistory } from "../core/vcs/dag";
-import { diffTrees, loadTreeFiles } from "../core/vcs/diff";
-import { Repository } from "../core/vcs/Repository";
-import type { PendingMergeState } from "../core/vcs/Repository";
+import { create } from 'zustand';
+import { IndexedDBObjectStorage, type IObjectStorage } from '../core/cas/ObjectStore';
+import { computeStorageTelemetry } from '../core/cas/telemetry';
+import { LOCAL_EDIT_ORIGIN } from '../core/crdt/origins';
+import { TabSyncBridge } from '../core/crdt/TabSyncBridge';
+import { FileUndoManager } from '../core/crdt/undo';
+import { WorkingTreeDoc } from '../core/crdt/WorkingTreeDoc';
+import {
+  buildRepoArchive,
+  buildRepoZipBytes,
+  serializeRepoArchiveJSON,
+  type ChronicleArchiveV1,
+} from '../core/archive/repoArchive';
+import { seedBlankWorkspace, seedDemoRepo } from '../core/seed/seedDemoRepo';
+import {
+  DEFAULT_AUTHOR_NAME,
+  DEFAULT_WORKSPACE_ID,
+  getWorkspaceDBNames,
+  WorkspaceRegistry,
+  type WorkspaceDBNames,
+  type WorkspaceKind,
+  type WorkspaceMeta,
+} from '../core/workspace/WorkspaceRegistry';
 import type {
   CommitObject,
+  FileDiff,
   MergeOutcome,
+  PendingMergeState,
   RefState,
-  Sha256Hash,
   StorageTelemetry,
-  WorkingFileDiff,
-} from "../core/types";
+  WorkingTreeStatus,
+} from '../core/types';
+import { diffTrees, diffWorkingTree } from '../core/vcs/diff';
+import {
+  hasConflictMarkers,
+  resolveConflictRegion,
+} from '../core/vcs/merge/conflictParser';
+import {
+  extractShareFragment,
+  generateShareBundle,
+  parseAndVerifySharePayload,
+  type GeneratedShareBundle,
+  type SharePayloadV1,
+} from '../core/share/shareLink';
+import {
+  IndexedDBSearchIndexStorage,
+  RepositorySearchEngine,
+  type ISearchIndexStorage,
+  type SearchIndexStats,
+  type SearchOccurrence,
+  type SearchResult,
+} from '../core/search/SearchIndex';
+import { Repository, UnmergedBranchError } from '../core/vcs/Repository';
 
-export interface StorageEstimate {
-  usage: number;
-  quota: number;
-}
+const PENDING_MERGE_META_KEY = 'chronicle_pending_merge_v1';
+const SEED_META_KEY = 'chronicle_demo_seeded_v1';
 
-interface WorkspaceServices {
-  storage: IndexedDBObjectStorage;
+export type ViewMode = 'editor' | 'diff';
+export type SearchScope = 'all' | 'working-tree';
+
+export interface ChronicleServices {
+  workspaceId: string;
+  dbNames: WorkspaceDBNames;
+  storage: IObjectStorage;
+  searchStorage: ISearchIndexStorage;
+  searchEngine: RepositorySearchEngine;
   workingTree: WorkingTreeDoc;
+  undoManager: FileUndoManager;
   bridge: TabSyncBridge;
   repo: Repository;
-  onDocUpdate: () => void;
 }
 
-export interface WorkspaceState {
-  status: "idle" | "loading" | "ready" | "error";
-  busy: boolean;
-  error: string | null;
+export interface StorageQuotaInfo {
+  usageBytes: number;
+  quotaBytes: number;
+}
 
+export interface WorkspaceNotice {
+  type: 'info' | 'success' | 'error';
+  message: string;
+}
+
+interface WorkspaceState {
+  initialized: boolean;
+  loading: boolean;
+  services: ChronicleServices | null;
+  files: Record<string, string>;
+  filePaths: string[];
+  activeFile: string | null;
   refs: RefState | null;
-  branches: Record<string, Sha256Hash>;
-  activeBranch: string | null;
-  remoteBranch: string | null;
-  log: CommitObject[];
-  graphCommits: CommitObject[];
-
-  diffs: WorkingFileDiff[];
-  fileContents: Record<string, string>;
-  activePath: string | null;
-  commitMessage: string;
-
+  commits: CommitObject[];
+  status: WorkingTreeStatus;
+  diffs: FileDiff[];
   pendingMerge: PendingMergeState | null;
-  mergeOutcome: MergeOutcome | null;
+  telemetry: StorageTelemetry;
+  latencyHistoryMs: number[];
+  quota: StorageQuotaInfo | null;
+  peerCount: number;
 
-  telemetry: StorageTelemetry | null;
-  latencySamples: number[];
-  storageEstimate: StorageEstimate | null;
-
-  workingTree: WorkingTreeDoc | null;
+  viewMode: ViewMode;
   xrayOpen: boolean;
   paletteOpen: boolean;
-  inspectedCommit: CommitObject | null;
-  inspectedDiffs: WorkingFileDiff[];
+  searchOpen: boolean;
+  searchQuery: string;
+  searchScope: SearchScope;
+  searchResults: SearchResult[];
+  searchStats: SearchIndexStats;
+  searchLoading: boolean;
+  shareModalOpen: boolean;
+  shareLoading: boolean;
+  shareBundle: GeneratedShareBundle | null;
+  pendingSharedImport: SharePayloadV1 | null;
+  workspaceModalOpen: boolean;
+  backupModalOpen: boolean;
+  workspaces: WorkspaceMeta[];
+  activeWorkspaceId: string;
+  authorName: string;
+  selectedCommitHash: string | null;
+  selectedCommitDiffs: FileDiff[];
+  notice: WorkspaceNotice | null;
 
-  initialize(): Promise<void>;
-  refresh(measuredLatencyMs?: number): Promise<void>;
-  selectFile(path: string | null): void;
-  setCommitMessage(value: string): void;
-  setPaletteOpen(open: boolean): void;
-  toggleXray(): void;
+  canUndoActive: boolean;
+  canRedoActive: boolean;
 
-  commit(): Promise<void>;
-  createBranch(name: string): Promise<void>;
-  checkout(branch: string): Promise<void>;
-  merge(branch: string): Promise<void>;
-  abortMerge(): Promise<void>;
-  resolveConflict(path: string, resolution: ConflictResolution): Promise<void>;
-  completeMerge(): Promise<void>;
-  resetDemo(): Promise<void>;
-  newFile(): Promise<void>;
-  deleteFile(path: string): Promise<void>;
-  inspectCommit(hash: Sha256Hash): Promise<void>;
-  closeInspector(): void;
-  openTwinTab(): void;
+  initWorkspace: () => Promise<void>;
+  disposeWorkspace: () => void;
+  setViewMode: (mode: ViewMode) => void;
+  setActiveFile: (path: string | null) => void;
+  setXRayOpen: (open: boolean) => void;
+  setPaletteOpen: (open: boolean) => void;
+  setSearchOpen: (open: boolean) => void;
+  setWorkspaceModalOpen: (open: boolean) => void;
+  setBackupModalOpen: (open: boolean) => void;
+  setAuthorName: (name: string) => boolean;
+  createWorkspace: (name: string, kind: 'blank' | 'demo') => Promise<boolean>;
+  switchWorkspace: (id: string) => Promise<boolean>;
+  renameWorkspace: (id: string, name: string) => boolean;
+  deleteWorkspace: (id: string) => Promise<boolean>;
+  runSearch: (query: string, scope?: SearchScope) => Promise<void>;
+  openSearchResult: (result: SearchResult, occurrence: SearchOccurrence) => Promise<void>;
+  clearNotice: () => void;
+  setNotice: (notice: WorkspaceNotice) => void;
+
+  openShareModal: () => Promise<void>;
+  closeShareModal: () => void;
+  handleShareHash: (hash: string) => Promise<void>;
+  applySharedImport: (payload: SharePayloadV1) => Promise<void>;
+  dismissSharedImport: () => void;
+
+  exportRepoArchiveJSON: () => Promise<{ filename: string; content: string } | null>;
+  exportRepoArchiveZip: () => Promise<{ filename: string; bytes: Uint8Array } | null>;
+  importArchivePayload: (
+    archive: ChronicleArchiveV1,
+    mode: 'new-workspace' | 'replace-current'
+  ) => Promise<boolean>;
+  importFilesIntoWorkingTree: (
+    importedFiles: Record<string, string>,
+    skippedCount?: number
+  ) => void;
+
+  refreshState: () => Promise<void>;
+  selectCommitForInspect: (commitHash: string | null) => Promise<void>;
+  openCommitInXRay: (commitHash: string) => Promise<void>;
+  simulateSampleEdit: () => void;
+  exportSnapshot: () => string;
+
+  createFile: (path: string, content?: string) => void;
+  renameFile: (oldPath: string, newPath: string) => boolean;
+  deleteFile: (path: string) => void;
+  undoActiveFile: () => void;
+  redoActiveFile: () => void;
+
+  commitChanges: (message: string) => Promise<boolean>;
+  createBranch: (name: string) => Promise<boolean>;
+  deleteBranch: (name: string, force?: boolean) => Promise<'deleted' | 'unmerged' | 'error'>;
+  checkoutTarget: (branchOrHash: string) => Promise<boolean>;
+  mergeBranch: (targetBranch: string) => Promise<MergeOutcome | null>;
+  resolveConflict: (
+    path: string,
+    regionIndex: number,
+    choice: 'ours' | 'theirs' | 'both'
+  ) => void;
+  completeMerge: (message?: string) => Promise<boolean>;
+  abortMerge: () => Promise<void>;
+  resetDemo: () => Promise<void>;
 }
 
-let services: WorkspaceServices | null = null;
-let bootPromise: Promise<void> | null = null;
+const EMPTY_STATUS: WorkingTreeStatus = {
+  clean: true,
+  modified: [],
+  added: [],
+  deleted: [],
+  conflicted: [],
+  changes: {},
+};
+
+const EMPTY_TELEMETRY: StorageTelemetry = {
+  blobCount: 0,
+  treeCount: 0,
+  commitCount: 0,
+  logicalBytes: 0,
+  deduplicatedBytes: 0,
+  deduplicationRatio: 1,
+  lastWriteLatencyMs: 0,
+  latencyHistoryMs: [],
+};
+
+let unsubFilesChange: (() => void) | null = null;
 let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+let registryInstance: WorkspaceRegistry | null = null;
 
-function describeError(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  return String(error);
-}
-
-function pickActivePath(
-  files: Record<string, string>,
-  current: string | null,
-): string | null {
-  if (current && Object.prototype.hasOwnProperty.call(files, current)) {
-    return current;
+function getRegistry(): WorkspaceRegistry {
+  if (!registryInstance) {
+    registryInstance = new WorkspaceRegistry();
   }
-  return Object.keys(files).sort()[0] ?? null;
+  return registryInstance;
 }
 
-function appendLatency(samples: number[], latency: number): number[] {
-  return [...samples, latency].slice(-24);
-}
-
-function dedupeCommits(histories: CommitObject[][]): CommitObject[] {
-  const byHash = new Map<Sha256Hash, CommitObject>();
-  for (const history of histories) {
-    for (const commit of history) {
-      if (!byHash.has(commit.hash)) byHash.set(commit.hash, commit);
+function deleteIndexedDBQuietly(dbName: string): Promise<void> {
+  if (typeof indexedDB === 'undefined') return Promise.resolve();
+  return new Promise((resolve) => {
+    try {
+      const req = indexedDB.deleteDatabase(dbName);
+      req.onsuccess = () => resolve();
+      req.onerror = () => resolve();
+      req.onblocked = () => resolve();
+    } catch {
+      resolve();
     }
-  }
-  return [...byHash.values()].sort((left, right) => {
-    if (left.timestamp !== right.timestamp) return left.timestamp - right.timestamp;
-    return left.hash < right.hash ? -1 : left.hash > right.hash ? 1 : 0;
   });
 }
 
-function scheduleRefresh(delayMs = 90): void {
-  if (refreshTimer !== null) clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(() => {
-    refreshTimer = null;
-    void useWorkspaceStore.getState().refresh();
-  }, delayMs);
-}
-
-async function estimateStorage(): Promise<StorageEstimate | null> {
-  if (typeof navigator === "undefined" || !navigator.storage?.estimate) {
+async function readStorageQuota(): Promise<StorageQuotaInfo | null> {
+  if (typeof navigator === 'undefined' || !navigator.storage?.estimate) {
     return null;
   }
   try {
-    const estimate = await navigator.storage.estimate();
+    const est = await navigator.storage.estimate();
     return {
-      usage: estimate.usage ?? 0,
-      quota: estimate.quota ?? 0,
+      usageBytes: est.usage ?? 0,
+      quotaBytes: est.quota ?? 0,
     };
   } catch {
     return null;
   }
 }
 
-async function disposeServices(): Promise<void> {
-  if (!services) return;
-  const current = services;
-  services = null;
-  current.bridge.stop();
-  current.workingTree.doc.off("update", current.onDocUpdate);
-  await current.workingTree.destroy();
-  await current.storage.close();
-}
-
-async function createServices(options: { forceSeed?: boolean } = {}): Promise<WorkspaceServices> {
-  const storage = new IndexedDBObjectStorage();
-  const workingTree = new WorkingTreeDoc();
+async function createServices(
+  options: {
+    workspaceMeta: WorkspaceMeta;
+    authorName: string;
+    forceSeed?: boolean;
+  },
+  onLatency: (ms: number) => void,
+  onRemoteFilesChange: () => void,
+  onBranchSync: () => void,
+  onPeerSync: () => void
+): Promise<ChronicleServices> {
+  const dbNames = getWorkspaceDBNames(options.workspaceMeta.id);
+  const storage = new IndexedDBObjectStorage(dbNames.casDbName);
+  if (options.forceSeed) {
+    await deleteIndexedDBQuietly(dbNames.crdtDocName);
+  }
+  const workingTree = new WorkingTreeDoc({ docName: dbNames.crdtDocName });
   await workingTree.whenSynced;
 
-  const repo = new Repository({
+  return finishServicesSetup(
+    options.workspaceMeta,
+    options.authorName,
+    dbNames,
     storage,
     workingTree,
-    author: "Local Editor",
-    defaultBranch: DEMO_MAIN_BRANCH,
-  });
+    Boolean(options.forceSeed),
+    onLatency,
+    onRemoteFilesChange,
+    onBranchSync,
+    onPeerSync
+  );
+}
 
-  const seed = await seedDemoRepo({
-    storage,
-    workingTree,
-    force: options.forceSeed,
-  });
-
-  if (!seed.seeded && Object.keys(workingTree.readFiles()).length === 0) {
-    const headHash =
-      seed.refs.head.type === "branch"
-        ? seed.refs.branches[seed.refs.head.name]
-        : seed.refs.head.commitHash;
-    if (headHash) {
-      const head = await getCommit(storage, headHash);
-      const files = await loadTreeFiles(storage, head.treeHash);
-      workingTree.hydrateFromTree(files);
+async function finishServicesSetup(
+  workspaceMeta: WorkspaceMeta,
+  authorName: string,
+  dbNames: WorkspaceDBNames,
+  storage: IObjectStorage,
+  workingTree: WorkingTreeDoc,
+  forceSeed: boolean,
+  onLatency: (ms: number) => void,
+  onRemoteFilesChange: () => void,
+  onBranchSync: () => void,
+  onPeerSync: () => void
+): Promise<ChronicleServices> {
+  let didSeed = false;
+  if (workspaceMeta.kind === 'demo') {
+    didSeed = await seedDemoRepo(storage, { force: forceSeed });
+  } else {
+    if (forceSeed) {
+      await storage.clear();
     }
+    didSeed = await seedBlankWorkspace(storage, workspaceMeta.name, authorName);
   }
 
+  const repo = new Repository(storage, onLatency);
+  const searchStorage = new IndexedDBSearchIndexStorage(dbNames.searchDbName);
+  if (forceSeed) {
+    await searchStorage.clear();
+  }
+  const searchEngine = new RepositorySearchEngine(storage, searchStorage);
+
+  if (didSeed || workingTree.listFiles().length === 0) {
+    const headFiles = await repo.getHeadFiles();
+    workingTree.hydrateFromTree(headFiles);
+  }
+
+  const undoManager = new FileUndoManager(workingTree.doc, workingTree.filesMap);
   const bridge = new TabSyncBridge(workingTree.doc, {
-    persistence: workingTree.persistence,
-    ready: workingTree.whenSynced,
-    onBranchChange: (branch) => {
-      useWorkspaceStore.setState({ remoteBranch: branch });
-      scheduleRefresh(120);
-    },
+    channelName: dbNames.broadcastChannelName,
+    onBranchChange: () => onBranchSync(),
+    onPeerSync: () => onPeerSync(),
   });
 
-  const onDocUpdate = () => scheduleRefresh();
-  workingTree.doc.on("update", onDocUpdate);
+  unsubFilesChange = workingTree.onFilesChange(() => {
+    onRemoteFilesChange();
+  });
 
-  services = { storage, workingTree, bridge, repo, onDocUpdate };
-  return services;
-}
-
-function requireServices(): WorkspaceServices {
-  if (!services) {
-    throw new Error("Workspace has not been initialized");
-  }
-  return services;
-}
-
-async function collectTelemetry(
-  current: WorkspaceServices,
-  measuredLatencyMs?: number,
-  previousLatency = 0,
-): Promise<{ telemetry: StorageTelemetry; estimate: StorageEstimate | null }> {
-  const [objects, estimate] = await Promise.all([
-    current.storage.listObjects(),
-    estimateStorage(),
-  ]);
   return {
-    telemetry: computeStorageTelemetry(
-      objects,
-      measuredLatencyMs ?? previousLatency,
-    ),
-    estimate,
+    workspaceId: workspaceMeta.id,
+    dbNames,
+    storage,
+    searchStorage,
+    searchEngine,
+    workingTree,
+    undoManager,
+    bridge,
+    repo,
   };
 }
 
-export const useWorkspaceStore = create<WorkspaceState>()((set, get) => ({
-  status: "idle",
-  busy: false,
-  error: null,
+function disposeServices(services: ChronicleServices | null): void {
+  if (refreshTimer) {
+    clearTimeout(refreshTimer);
+    refreshTimer = null;
+  }
+  unsubFilesChange?.();
+  unsubFilesChange = null;
+  if (!services) return;
+  services.bridge.destroy();
+  services.undoManager.destroy();
+  services.workingTree.destroy();
+  services.searchStorage.close();
+  services.storage.close();
+}
 
+export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
+  initialized: false,
+  loading: false,
+  services: null,
+  files: {},
+  filePaths: [],
+  activeFile: null,
   refs: null,
-  branches: {},
-  activeBranch: null,
-  remoteBranch: null,
-  log: [],
-  graphCommits: [],
-
+  commits: [],
+  status: EMPTY_STATUS,
   diffs: [],
-  fileContents: {},
-  activePath: null,
-  commitMessage: "",
-
   pendingMerge: null,
-  mergeOutcome: null,
+  telemetry: EMPTY_TELEMETRY,
+  latencyHistoryMs: [],
+  quota: null,
+  peerCount: 0,
 
-  telemetry: null,
-  latencySamples: [],
-  storageEstimate: null,
-
-  workingTree: null,
+  viewMode: 'editor',
   xrayOpen: false,
   paletteOpen: false,
-  inspectedCommit: null,
-  inspectedDiffs: [],
+  searchOpen: false,
+  searchQuery: '',
+  searchScope: 'all',
+  searchResults: [],
+  searchStats: { indexedBlobCount: 0, tokenCount: 0 },
+  searchLoading: false,
+  shareModalOpen: false,
+  shareLoading: false,
+  shareBundle: null,
+  pendingSharedImport: null,
+  workspaceModalOpen: false,
+  backupModalOpen: false,
+  workspaces: [],
+  activeWorkspaceId: DEFAULT_WORKSPACE_ID,
+  authorName: DEFAULT_AUTHOR_NAME,
+  selectedCommitHash: null,
+  selectedCommitDiffs: [],
+  notice: null,
 
-  async initialize() {
-    if (get().status === "ready") return;
-    if (bootPromise) return bootPromise;
+  canUndoActive: false,
+  canRedoActive: false,
 
-    bootPromise = (async () => {
-      set({ status: "loading", error: null });
-      try {
-        if (!services) await createServices();
-        set({ workingTree: services?.workingTree ?? null });
-        await get().refresh();
-        set({ status: "ready" });
-      } catch (error) {
-        set({ status: "error", error: describeError(error) });
-      } finally {
-        bootPromise = null;
-      }
-    })();
+  initWorkspace: async () => {
+    if (get().initialized || get().loading) return;
+    const registry = getRegistry();
+    const activeMeta = registry.getActiveWorkspace();
+    const dbNames = getWorkspaceDBNames(activeMeta.id);
 
-    return bootPromise;
-  },
-
-  async refresh(measuredLatencyMs) {
-    const current = services;
-    if (!current) return;
+    set({
+      loading: true,
+      workspaces: registry.listWorkspaces(),
+      activeWorkspaceId: activeMeta.id,
+      authorName: registry.getAuthorName(),
+    });
 
     try {
-      const refs = await current.repo.getRefs();
-      const [log, diffs, telemetryBundle, histories] = await Promise.all([
-        current.repo.log(),
-        current.repo.status(),
-        collectTelemetry(
-          current,
-          measuredLatencyMs,
-          get().telemetry?.lastWriteLatencyMs ?? 0,
-        ),
-        Promise.all(
-          Object.values(refs?.branches ?? {}).map((hash) =>
-            getCommitHistory(current.storage, hash),
-          ),
-        ),
-      ]);
-      const pendingMerge = current.repo.getPendingMerge();
+      const incomingFragment =
+        typeof window !== 'undefined'
+          ? extractShareFragment(window.location.hash)
+          : null;
+      let parsedIncoming: SharePayloadV1 | null = null;
+      let incomingError: string | null = null;
 
-      const fileContents = current.workingTree.readFiles();
-      const activePath = pickActivePath(fileContents, get().activePath);
-      const activeBranch =
-        refs?.head.type === "branch" ? refs.head.name : null;
-      const latencySamples =
-        measuredLatencyMs === undefined
-          ? get().latencySamples
-          : appendLatency(get().latencySamples, measuredLatencyMs);
+      if (incomingFragment) {
+        try {
+          parsedIncoming = await parseAndVerifySharePayload(incomingFragment);
+        } catch (err) {
+          incomingError =
+            err instanceof Error
+              ? err.message
+              : 'Could not decode shared workspace link.';
+        }
+      }
+
+      const recordLatency = (ms: number) => {
+        const rounded = Number(ms.toFixed(2));
+        set((state) => ({
+          latencyHistoryMs: [...state.latencyHistoryMs.slice(-19), rounded],
+        }));
+      };
+
+      const scheduleRefresh = () => {
+        if (refreshTimer) clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(() => {
+          void get().refreshState();
+        }, 16);
+      };
+
+      // If fresh origin (no existing repo) and valid incoming share link, import immediately
+      if (parsedIncoming) {
+        const probeStorage = new IndexedDBObjectStorage(dbNames.casDbName);
+        const existingRefs = await probeStorage.getRefs();
+        if (!existingRefs) {
+          await probeStorage.clear();
+          await probeStorage.writeBatch(parsedIncoming.objects, parsedIncoming.refs);
+          await probeStorage.setMeta(SEED_META_KEY, true);
+          probeStorage.close();
+
+          const workingTree = new WorkingTreeDoc({ docName: dbNames.crdtDocName });
+          await workingTree.whenSynced;
+          await workingTree.clearDocument();
+          const freshTree = new WorkingTreeDoc({ docName: dbNames.crdtDocName });
+          await freshTree.whenSynced;
+          freshTree.hydrateFromTree(parsedIncoming.workingTreeFiles);
+
+          const shareStorage = new IndexedDBObjectStorage(dbNames.casDbName);
+          const shareSearchStorage = new IndexedDBSearchIndexStorage(dbNames.searchDbName);
+          await shareSearchStorage.clear();
+          const shareSearchEngine = new RepositorySearchEngine(
+            shareStorage,
+            shareSearchStorage
+          );
+          const repo = new Repository(shareStorage, recordLatency);
+          const undoManager = new FileUndoManager(freshTree.doc, freshTree.filesMap);
+          const bridge = new TabSyncBridge(freshTree.doc, {
+            channelName: dbNames.broadcastChannelName,
+            onBranchChange: () => void get().refreshState(),
+            onPeerSync: () => {
+              const current = get().services;
+              if (current) set({ peerCount: current.bridge.getPeerCount() });
+            },
+          });
+          unsubFilesChange = freshTree.onFilesChange(() => scheduleRefresh());
+
+          const services: ChronicleServices = {
+            workspaceId: activeMeta.id,
+            dbNames,
+            storage: shareStorage,
+            searchStorage: shareSearchStorage,
+            searchEngine: shareSearchEngine,
+            workingTree: freshTree,
+            undoManager,
+            bridge,
+            repo,
+          };
+
+          if (typeof window !== 'undefined') {
+            window.history.replaceState(
+              null,
+              '',
+              window.location.pathname + window.location.search
+            );
+          }
+
+          set({
+            services,
+            pendingMerge: null,
+            activeFile: parsedIncoming.activeFile,
+            initialized: true,
+            loading: false,
+            notice: {
+              type: 'success',
+              message: 'Loaded shared Chronicle workspace from link.',
+            },
+          });
+          await get().refreshState();
+          return;
+        }
+        probeStorage.close();
+      }
+
+      const services = await createServices(
+        {
+          workspaceMeta: activeMeta,
+          authorName: registry.getAuthorName(),
+          forceSeed: false,
+        },
+        recordLatency,
+        scheduleRefresh,
+        () => {
+          void get().refreshState();
+        },
+        () => {
+          const current = get().services;
+          if (current) {
+            set({ peerCount: current.bridge.getPeerCount() });
+          }
+        }
+      );
+
+      const savedPending = await services.storage.getMeta<PendingMergeState | null>(
+        PENDING_MERGE_META_KEY
+      );
 
       set({
-        refs,
-        branches: refs ? { ...refs.branches } : {},
-        activeBranch,
-        log,
-        graphCommits: dedupeCommits(histories),
-        diffs,
-        fileContents,
-        activePath,
-        pendingMerge,
-        telemetry: telemetryBundle.telemetry,
-        storageEstimate: telemetryBundle.estimate,
-        latencySamples,
-        error: null,
+        services,
+        pendingMerge: savedPending ?? null,
+        pendingSharedImport: parsedIncoming,
+        initialized: true,
+        loading: false,
+        notice: incomingError
+          ? { type: 'error', message: incomingError }
+          : null,
       });
-    } catch (error) {
-      set({ error: describeError(error) });
+
+      if (incomingError && typeof window !== 'undefined') {
+        window.history.replaceState(
+          null,
+          '',
+          window.location.pathname + window.location.search
+        );
+      }
+
+      await get().refreshState();
+
+      // Default active file
+      const paths = get().filePaths;
+      if (paths.length > 0 && !get().activeFile) {
+        const preferred = paths.includes('README.md') ? 'README.md' : paths[0];
+        set({ activeFile: preferred });
+        const svc = get().services;
+        if (svc) {
+          set({
+            canUndoActive: svc.undoManager.canUndo(preferred),
+            canRedoActive: svc.undoManager.canRedo(preferred),
+          });
+        }
+      }
+    } catch (err) {
+      set({
+        loading: false,
+        notice: {
+          type: 'error',
+          message:
+            err instanceof Error
+              ? err.message
+              : 'Failed to initialize Chronicle workspace.',
+        },
+      });
     }
   },
 
-  selectFile(path) {
-    set({ activePath: path, inspectedCommit: null, inspectedDiffs: [] });
+  disposeWorkspace: () => {
+    disposeServices(get().services);
+    set({ services: null, initialized: false });
   },
 
-  setCommitMessage(value) {
-    set({ commitMessage: value });
+  setViewMode: (mode) => set({ viewMode: mode }),
+
+  setActiveFile: (path) => {
+    const svc = get().services;
+    set({
+      activeFile: path,
+      canUndoActive: path && svc ? svc.undoManager.canUndo(path) : false,
+      canRedoActive: path && svc ? svc.undoManager.canRedo(path) : false,
+    });
   },
 
-  setPaletteOpen(open) {
-    set({ paletteOpen: open });
+  setXRayOpen: (open) => {
+    set({ xrayOpen: open });
+    if (open) {
+      void get().refreshState();
+    }
   },
 
-  toggleXray() {
-    set((state) => ({ xrayOpen: !state.xrayOpen }));
+  setPaletteOpen: (open) => set({ paletteOpen: open }),
+
+  setWorkspaceModalOpen: (open) => set({ workspaceModalOpen: open }),
+
+  setBackupModalOpen: (open) => set({ backupModalOpen: open }),
+
+  setAuthorName: (name) => {
+    try {
+      const registry = getRegistry();
+      const saved = registry.setAuthorName(name);
+      set({
+        authorName: saved,
+        notice: { type: 'success', message: `Commit author updated to "${saved}".` },
+      });
+      return true;
+    } catch (err) {
+      set({
+        notice: {
+          type: 'error',
+          message: err instanceof Error ? err.message : 'Invalid author name.',
+        },
+      });
+      return false;
+    }
   },
 
-  async commit() {
-    const current = requireServices();
-    const message = get().commitMessage.trim();
-    if (message === "") {
-      set({ error: "Write a commit message first" });
+  createWorkspace: async (name, kind) => {
+    const registry = getRegistry();
+    let created: WorkspaceMeta;
+    try {
+      created = registry.createWorkspace(name, kind);
+    } catch (err) {
+      set({
+        notice: {
+          type: 'error',
+          message: err instanceof Error ? err.message : 'Could not create workspace.',
+        },
+      });
+      return false;
+    }
+
+    const prevServices = get().services;
+    disposeServices(prevServices);
+    set({
+      loading: true,
+      services: null,
+      workspaces: registry.listWorkspaces(),
+      activeWorkspaceId: created.id,
+      workspaceModalOpen: false,
+      selectedCommitHash: null,
+      selectedCommitDiffs: [],
+      searchQuery: '',
+      searchResults: [],
+      viewMode: 'editor',
+    });
+
+    try {
+      const recordLatency = (ms: number) => {
+        const rounded = Number(ms.toFixed(2));
+        set((state) => ({
+          latencyHistoryMs: [...state.latencyHistoryMs.slice(-19), rounded],
+        }));
+      };
+      const scheduleRefresh = () => {
+        if (refreshTimer) clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(() => {
+          void get().refreshState();
+        }, 16);
+      };
+
+      const services = await createServices(
+        {
+          workspaceMeta: created,
+          authorName: registry.getAuthorName(),
+          forceSeed: true,
+        },
+        recordLatency,
+        scheduleRefresh,
+        () => void get().refreshState(),
+        () => {
+          const current = get().services;
+          if (current) set({ peerCount: current.bridge.getPeerCount() });
+        }
+      );
+
+      set({
+        services,
+        pendingMerge: null,
+        activeFile: null,
+        loading: false,
+        notice: {
+          type: 'success',
+          message: `Created and opened workspace "${created.name}".`,
+        },
+      });
+      await get().refreshState();
+      return true;
+    } catch (err) {
+      set({
+        loading: false,
+        notice: {
+          type: 'error',
+          message: err instanceof Error ? err.message : 'Failed to create workspace.',
+        },
+      });
+      return false;
+    }
+  },
+
+  switchWorkspace: async (id) => {
+    const registry = getRegistry();
+    if (id === get().activeWorkspaceId && get().services) {
+      set({ workspaceModalOpen: false });
+      return true;
+    }
+    let targetMeta: WorkspaceMeta;
+    try {
+      targetMeta = registry.setActiveWorkspace(id);
+    } catch (err) {
+      set({
+        notice: {
+          type: 'error',
+          message: err instanceof Error ? err.message : 'Workspace not found.',
+        },
+      });
+      return false;
+    }
+
+    const prevServices = get().services;
+    disposeServices(prevServices);
+    set({
+      loading: true,
+      services: null,
+      workspaces: registry.listWorkspaces(),
+      activeWorkspaceId: targetMeta.id,
+      workspaceModalOpen: false,
+      selectedCommitHash: null,
+      selectedCommitDiffs: [],
+      searchQuery: '',
+      searchResults: [],
+      activeFile: null,
+      viewMode: 'editor',
+    });
+
+    try {
+      const recordLatency = (ms: number) => {
+        const rounded = Number(ms.toFixed(2));
+        set((state) => ({
+          latencyHistoryMs: [...state.latencyHistoryMs.slice(-19), rounded],
+        }));
+      };
+      const scheduleRefresh = () => {
+        if (refreshTimer) clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(() => {
+          void get().refreshState();
+        }, 16);
+      };
+
+      const services = await createServices(
+        {
+          workspaceMeta: targetMeta,
+          authorName: registry.getAuthorName(),
+          forceSeed: false,
+        },
+        recordLatency,
+        scheduleRefresh,
+        () => void get().refreshState(),
+        () => {
+          const current = get().services;
+          if (current) set({ peerCount: current.bridge.getPeerCount() });
+        }
+      );
+
+      const savedPending = await services.storage.getMeta<PendingMergeState | null>(
+        PENDING_MERGE_META_KEY
+      );
+
+      set({
+        services,
+        pendingMerge: savedPending ?? null,
+        loading: false,
+        notice: {
+          type: 'info',
+          message: `Switched to workspace "${targetMeta.name}".`,
+        },
+      });
+      await get().refreshState();
+      return true;
+    } catch (err) {
+      set({
+        loading: false,
+        notice: {
+          type: 'error',
+          message: err instanceof Error ? err.message : 'Failed to switch workspace.',
+        },
+      });
+      return false;
+    }
+  },
+
+  renameWorkspace: (id, name) => {
+    try {
+      const registry = getRegistry();
+      const updated = registry.renameWorkspace(id, name);
+      set({
+        workspaces: registry.listWorkspaces(),
+        notice: { type: 'success', message: `Renamed workspace to "${updated.name}".` },
+      });
+      return true;
+    } catch (err) {
+      set({
+        notice: {
+          type: 'error',
+          message: err instanceof Error ? err.message : 'Rename failed.',
+        },
+      });
+      return false;
+    }
+  },
+
+  deleteWorkspace: async (id) => {
+    const registry = getRegistry();
+    const wasActive = id === get().activeWorkspaceId;
+    let res: { nextActiveId: string; deleted: WorkspaceMeta };
+    try {
+      res = registry.deleteWorkspace(id);
+    } catch (err) {
+      set({
+        notice: {
+          type: 'error',
+          message: err instanceof Error ? err.message : 'Cannot delete workspace.',
+        },
+      });
+      return false;
+    }
+
+    if (wasActive) {
+      disposeServices(get().services);
+      set({ services: null });
+    }
+
+    const dbNames = getWorkspaceDBNames(id);
+    await Promise.all([
+      deleteIndexedDBQuietly(dbNames.casDbName),
+      deleteIndexedDBQuietly(dbNames.searchDbName),
+      deleteIndexedDBQuietly(dbNames.crdtDocName),
+    ]);
+
+    set({ workspaces: registry.listWorkspaces() });
+
+    if (wasActive) {
+      await get().switchWorkspace(res.nextActiveId);
+    }
+    set({
+      notice: {
+        type: 'info',
+        message: `Deleted workspace "${res.deleted.name}".`,
+      },
+    });
+    return true;
+  },
+
+  setSearchOpen: (open) => {
+    set({ searchOpen: open });
+    if (open) {
+      const { services, searchQuery, searchScope } = get();
+      if (services) {
+        void services.searchEngine.syncIndex().then((stats) => {
+          set({ searchStats: stats });
+          if (searchQuery.trim()) {
+            void get().runSearch(searchQuery, searchScope);
+          }
+        });
+      }
+    }
+  },
+
+  runSearch: async (query, scopeOverride) => {
+    const { services, refs, files, searchScope } = get();
+    const scope = scopeOverride ?? searchScope;
+    set({ searchQuery: query, searchScope: scope });
+
+    if (!services) return;
+    if (!query.trim()) {
+      const stats = await services.searchEngine.syncIndex();
+      set({ searchResults: [], searchStats: stats, searchLoading: false });
       return;
     }
 
-    set({ busy: true, error: null });
-    const start = performance.now();
+    set({ searchLoading: true });
     try {
-      await current.repo.commit({ message });
-      const latency = performance.now() - start;
-      set({ commitMessage: "" });
-      await get().refresh(latency);
-    } catch (error) {
-      set({ error: describeError(error) });
-    } finally {
-      set({ busy: false });
-    }
-  },
-
-  async createBranch(name) {
-    const current = requireServices();
-    const branch = name.trim();
-    if (branch === "") return;
-
-    set({ busy: true, error: null });
-    try {
-      await current.repo.createBranch(branch);
-      await get().refresh();
-    } catch (error) {
-      set({ error: describeError(error) });
-    } finally {
-      set({ busy: false });
-    }
-  },
-
-  async checkout(branch) {
-    const current = requireServices();
-    set({ busy: true, error: null });
-    const start = performance.now();
-    try {
-      await current.repo.checkout(branch);
-      const latency = performance.now() - start;
-      current.bridge.broadcastBranchChange(branch);
-      set({ mergeOutcome: null });
-      await get().refresh(latency);
-    } catch (error) {
-      set({ error: describeError(error) });
-    } finally {
-      set({ busy: false });
-    }
-  },
-
-  async merge(branch) {
-    const current = requireServices();
-    set({ busy: true, error: null });
-    const start = performance.now();
-    try {
-      const outcome = await current.repo.merge(branch);
-      const latency = performance.now() - start;
-      set({ mergeOutcome: outcome, error: null });
-      await get().refresh(latency);
-    } catch (error) {
-      set({ error: describeError(error) });
-    } finally {
-      set({ busy: false });
-    }
-  },
-
-  async abortMerge() {
-    const current = requireServices();
-    set({ busy: true, error: null });
-    try {
-      await current.repo.abortMerge();
-      set({ mergeOutcome: null });
-      await get().refresh();
-    } catch (error) {
-      set({ error: describeError(error) });
-    } finally {
-      set({ busy: false });
-    }
-  },
-
-  async resolveConflict(path, resolution) {
-    const current = requireServices();
-    const currentContent = current.workingTree.readFiles()[path] ?? "";
-    const resolved = resolveConflictMarkers(currentContent, resolution);
-    current.workingTree.setFile(path, resolved, "conflict-resolution");
-    await get().refresh();
-  },
-
-  async completeMerge() {
-    const current = requireServices();
-    set({ busy: true, error: null });
-    const start = performance.now();
-    try {
-      await current.repo.completeMergeCommit();
-      const latency = performance.now() - start;
-      set({ mergeOutcome: null });
-      await get().refresh(latency);
-    } catch (error) {
-      set({ error: describeError(error) });
-    } finally {
-      set({ busy: false });
-    }
-  },
-
-  async resetDemo() {
-    set({ busy: true, error: null });
-    try {
-      await disposeServices();
-      await clearDocument(DEFAULT_PERSISTENCE_NAME);
-      await createServices({ forceSeed: true });
-      set({
-        workingTree: services?.workingTree ?? null,
-        activePath: null,
-        mergeOutcome: null,
-        inspectedCommit: null,
-        inspectedDiffs: [],
-        commitMessage: "",
-        latencySamples: [],
+      const results = await services.searchEngine.search({
+        query,
+        refs,
+        workingTreeFiles: files,
+        scope,
       });
-      await get().refresh();
-      set({ status: "ready" });
-    } catch (error) {
-      set({ status: "error", error: describeError(error) });
-    } finally {
-      set({ busy: false });
+      const stats = await services.searchStorage.getStats();
+      if (get().searchQuery === query && get().searchScope === scope) {
+        set({
+          searchResults: results,
+          searchStats: stats,
+          searchLoading: false,
+        });
+      }
+    } catch {
+      set({ searchLoading: false });
     }
   },
 
-  async newFile() {
-    const current = requireServices();
-    const files = current.workingTree.readFiles();
-    let index = 1;
-    let path = "untitled.md";
-    while (Object.prototype.hasOwnProperty.call(files, path)) {
-      index += 1;
-      path = `untitled-${index}.md`;
+  openSearchResult: async (_result, occurrence) => {
+    set({ searchOpen: false });
+    if (occurrence.source === 'working-tree') {
+      const { files } = get();
+      if (files[occurrence.path] !== undefined) {
+        get().setActiveFile(occurrence.path);
+        set({ viewMode: 'editor' });
+      }
+      return;
     }
-    current.workingTree.setFile(path, `# Untitled\n\nStart writing.\n`);
-    set({ activePath: path });
-    await get().refresh();
+    if (occurrence.commitHash) {
+      await get().openCommitInXRay(occurrence.commitHash);
+    }
   },
 
-  async deleteFile(path) {
-    const current = requireServices();
-    current.workingTree.deleteFile(path);
-    if (get().activePath === path) set({ activePath: null });
-    await get().refresh();
-  },
+  clearNotice: () => set({ notice: null }),
 
-  async inspectCommit(hash) {
-    const current = requireServices();
+  setNotice: (notice) => set({ notice }),
+
+  openShareModal: async () => {
+    const { services, refs, files, activeFile } = get();
+    if (!services || !refs) return;
+    set({ shareLoading: true, shareModalOpen: true });
     try {
-      const commit = await getCommit(current.storage, hash);
-      const parentHash = commit.parentHashes[0] ?? null;
-      const inspectedDiffs = await diffTrees(
-        current.storage,
-        parentHash,
-        commit.hash,
-        { includeUnmodified: false },
-      );
-      set({ inspectedCommit: commit, inspectedDiffs, xrayOpen: true });
-    } catch (error) {
-      set({ error: describeError(error) });
+      const bundle = await generateShareBundle({
+        storage: services.storage,
+        refs,
+        workingTreeFiles: files,
+        activeFile,
+      });
+      set({ shareBundle: bundle, shareLoading: false });
+    } catch (err) {
+      set({
+        shareModalOpen: false,
+        shareLoading: false,
+        notice: {
+          type: 'error',
+          message:
+            err instanceof Error
+              ? err.message
+              : 'Failed to generate shareable link.',
+        },
+      });
     }
   },
 
-  closeInspector() {
-    set({ inspectedCommit: null, inspectedDiffs: [] });
+  closeShareModal: () => set({ shareModalOpen: false }),
+
+  handleShareHash: async (hash) => {
+    const fragment = extractShareFragment(hash);
+    if (!fragment) return;
+    try {
+      const payload = await parseAndVerifySharePayload(fragment);
+      set({ pendingSharedImport: payload });
+    } catch (err) {
+      if (typeof window !== 'undefined') {
+        window.history.replaceState(
+          null,
+          '',
+          window.location.pathname + window.location.search
+        );
+      }
+      set({
+        notice: {
+          type: 'error',
+          message:
+            err instanceof Error
+              ? err.message
+              : 'Invalid or corrupted shared workspace link.',
+        },
+      });
+    }
   },
 
-  openTwinTab() {
-    if (typeof window === "undefined") return;
-    window.open(window.location.href, "_blank", "noopener,noreferrer");
+  applySharedImport: async (payload) => {
+    const prevServices = get().services;
+    if (refreshTimer) {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
+    unsubFilesChange?.();
+    unsubFilesChange = null;
+    set({ loading: true, services: null, pendingSharedImport: null });
+
+    try {
+      if (prevServices) {
+        prevServices.bridge.destroy();
+        prevServices.undoManager.destroy();
+        await prevServices.workingTree.clearDocument();
+        prevServices.workingTree.destroy();
+        await prevServices.searchStorage.clear();
+        prevServices.searchStorage.close();
+        await prevServices.storage.clear();
+        prevServices.storage.close();
+      }
+
+      const recordLatency = (ms: number) => {
+        const rounded = Number(ms.toFixed(2));
+        set((state) => ({
+          latencyHistoryMs: [...state.latencyHistoryMs.slice(-19), rounded],
+        }));
+      };
+
+      const scheduleRefresh = () => {
+        if (refreshTimer) clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(() => {
+          void get().refreshState();
+        }, 16);
+      };
+
+      const activeMeta = getRegistry().getActiveWorkspace();
+      const dbNames = getWorkspaceDBNames(activeMeta.id);
+
+      const storage = new IndexedDBObjectStorage(dbNames.casDbName);
+      await storage.clear();
+      await storage.writeBatch(payload.objects, payload.refs);
+      await storage.setMeta(SEED_META_KEY, true);
+
+      const searchStorage = new IndexedDBSearchIndexStorage(dbNames.searchDbName);
+      await searchStorage.clear();
+      const searchEngine = new RepositorySearchEngine(storage, searchStorage);
+
+      const workingTree = new WorkingTreeDoc({ docName: dbNames.crdtDocName });
+      await workingTree.whenSynced;
+      await workingTree.clearDocument();
+      const freshTree = new WorkingTreeDoc({ docName: dbNames.crdtDocName });
+      await freshTree.whenSynced;
+      freshTree.hydrateFromTree(payload.workingTreeFiles);
+
+      const repo = new Repository(storage, recordLatency);
+      const undoManager = new FileUndoManager(freshTree.doc, freshTree.filesMap);
+      const bridge = new TabSyncBridge(freshTree.doc, {
+        channelName: dbNames.broadcastChannelName,
+        onBranchChange: () => void get().refreshState(),
+        onPeerSync: () => {
+          const current = get().services;
+          if (current) set({ peerCount: current.bridge.getPeerCount() });
+        },
+      });
+      unsubFilesChange = freshTree.onFilesChange(() => scheduleRefresh());
+
+      if (typeof window !== 'undefined') {
+        window.history.replaceState(
+          null,
+          '',
+          window.location.pathname + window.location.search
+        );
+      }
+
+      set({
+        services: {
+          workspaceId: activeMeta.id,
+          dbNames,
+          storage,
+          searchStorage,
+          searchEngine,
+          workingTree: freshTree,
+          undoManager,
+          bridge,
+          repo,
+        },
+        pendingMerge: null,
+        selectedCommitHash: null,
+        selectedCommitDiffs: [],
+        searchQuery: '',
+        searchResults: [],
+        activeFile: payload.activeFile,
+        viewMode: 'editor',
+        loading: false,
+        notice: {
+          type: 'success',
+          message: 'Loaded shared Chronicle workspace from link.',
+        },
+      });
+
+      await get().refreshState();
+    } catch (err) {
+      set({
+        loading: false,
+        notice: {
+          type: 'error',
+          message:
+            err instanceof Error
+              ? err.message
+              : 'Failed to import shared workspace.',
+        },
+      });
+    }
+  },
+
+  dismissSharedImport: () => {
+    if (typeof window !== 'undefined') {
+      window.history.replaceState(
+        null,
+        '',
+        window.location.pathname + window.location.search
+      );
+    }
+    set({ pendingSharedImport: null });
+  },
+
+  exportRepoArchiveJSON: async () => {
+    const { services, refs, files, activeFile } = get();
+    if (!services || !refs) return null;
+    const activeMeta = getRegistry().getActiveWorkspace();
+    const archive = await buildRepoArchive({
+      storage: services.storage,
+      refs,
+      workingTreeFiles: files,
+      activeFile,
+      workspaceName: activeMeta.name,
+    });
+    const slug = activeMeta.name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'chronicle';
+    return {
+      filename: `${slug}-archive-${new Date().toISOString().slice(0, 10)}.json`,
+      content: serializeRepoArchiveJSON(archive),
+    };
+  },
+
+  exportRepoArchiveZip: async () => {
+    const { services, refs, files, activeFile } = get();
+    if (!services || !refs) return null;
+    const activeMeta = getRegistry().getActiveWorkspace();
+    const archive = await buildRepoArchive({
+      storage: services.storage,
+      refs,
+      workingTreeFiles: files,
+      activeFile,
+      workspaceName: activeMeta.name,
+    });
+    const slug = activeMeta.name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'chronicle';
+    return {
+      filename: `${slug}-backup-${new Date().toISOString().slice(0, 10)}.zip`,
+      bytes: buildRepoZipBytes(archive),
+    };
+  },
+
+  importArchivePayload: async (archive, mode) => {
+    const registry = getRegistry();
+    const prevServices = get().services;
+    let targetMeta: WorkspaceMeta;
+
+    if (mode === 'new-workspace') {
+      targetMeta = registry.createWorkspace(archive.workspaceName, 'imported');
+    } else {
+      targetMeta = registry.getActiveWorkspace();
+    }
+
+    const dbNames = getWorkspaceDBNames(targetMeta.id);
+    if (refreshTimer) {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
+    unsubFilesChange?.();
+    unsubFilesChange = null;
+
+    set({
+      loading: true,
+      services: null,
+      backupModalOpen: false,
+      workspaces: registry.listWorkspaces(),
+      activeWorkspaceId: targetMeta.id,
+    });
+
+    try {
+      if (prevServices) {
+        prevServices.bridge.destroy();
+        prevServices.undoManager.destroy();
+        if (mode === 'replace-current') {
+          await prevServices.workingTree.clearDocument();
+        }
+        prevServices.workingTree.destroy();
+        if (mode === 'replace-current') {
+          await prevServices.searchStorage.clear();
+          await prevServices.storage.clear();
+        }
+        prevServices.searchStorage.close();
+        prevServices.storage.close();
+      }
+
+      const recordLatency = (ms: number) => {
+        const rounded = Number(ms.toFixed(2));
+        set((state) => ({
+          latencyHistoryMs: [...state.latencyHistoryMs.slice(-19), rounded],
+        }));
+      };
+      const scheduleRefresh = () => {
+        if (refreshTimer) clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(() => {
+          void get().refreshState();
+        }, 16);
+      };
+
+      const storage = new IndexedDBObjectStorage(dbNames.casDbName);
+      await storage.clear();
+      await storage.writeBatch(archive.objects, archive.refs);
+      await storage.setMeta(SEED_META_KEY, true);
+
+      const searchStorage = new IndexedDBSearchIndexStorage(dbNames.searchDbName);
+      await searchStorage.clear();
+      const searchEngine = new RepositorySearchEngine(storage, searchStorage);
+
+      await deleteIndexedDBQuietly(dbNames.crdtDocName);
+      const freshTree = new WorkingTreeDoc({ docName: dbNames.crdtDocName });
+      await freshTree.whenSynced;
+      freshTree.hydrateFromTree(archive.workingTreeFiles);
+
+      const repo = new Repository(storage, recordLatency);
+      const undoManager = new FileUndoManager(freshTree.doc, freshTree.filesMap);
+      const bridge = new TabSyncBridge(freshTree.doc, {
+        channelName: dbNames.broadcastChannelName,
+        onBranchChange: () => void get().refreshState(),
+        onPeerSync: () => {
+          const current = get().services;
+          if (current) set({ peerCount: current.bridge.getPeerCount() });
+        },
+      });
+      unsubFilesChange = freshTree.onFilesChange(() => scheduleRefresh());
+
+      set({
+        services: {
+          workspaceId: targetMeta.id,
+          dbNames,
+          storage,
+          searchStorage,
+          searchEngine,
+          workingTree: freshTree,
+          undoManager,
+          bridge,
+          repo,
+        },
+        pendingMerge: null,
+        selectedCommitHash: null,
+        selectedCommitDiffs: [],
+        searchQuery: '',
+        searchResults: [],
+        activeFile: archive.activeFile,
+        viewMode: 'editor',
+        loading: false,
+        notice: {
+          type: 'success',
+          message: `Imported "${targetMeta.name}" (${archive.objects.filter((o) => o.type === 'commit').length} commits).`,
+        },
+      });
+      await get().refreshState();
+      return true;
+    } catch (err) {
+      set({
+        loading: false,
+        notice: {
+          type: 'error',
+          message: err instanceof Error ? err.message : 'Archive import failed.',
+        },
+      });
+      return false;
+    }
+  },
+
+  importFilesIntoWorkingTree: (importedFiles, skippedCount = 0) => {
+    const { services } = get();
+    if (!services) return;
+    const entries = Object.entries(importedFiles).sort(([a], [b]) =>
+      a.localeCompare(b)
+    );
+    if (entries.length === 0) return;
+    for (const [path, content] of entries) {
+      services.workingTree.updateFileContent(path, content, LOCAL_EDIT_ORIGIN);
+    }
+    const firstPath = entries[0][0];
+    set({
+      activeFile: firstPath,
+      viewMode: 'editor',
+      backupModalOpen: false,
+      notice: {
+        type: 'success',
+        message: `Imported ${entries.length} file(s) into working tree${
+          skippedCount > 0 ? ` (${skippedCount} binary/ignored skipped)` : ''
+        }.`,
+      },
+    });
+    void get().refreshState();
+  },
+
+  refreshState: async () => {
+    const { services, pendingMerge, activeFile, latencyHistoryMs } = get();
+    if (!services) return;
+    if (!(await services.repo.isInitialized())) return;
+
+    const files = services.workingTree.getFileMap();
+    const filePaths = Object.keys(files).sort();
+    const refs = await services.repo.getRefs();
+    const headHash = await services.repo.getHeadCommitHash();
+    const [status, diffs, commits, quota] = await Promise.all([
+      services.repo.status(files, pendingMerge),
+      diffWorkingTree(services.storage, headHash, files),
+      services.repo.getAllCommits(),
+      readStorageQuota(),
+    ]);
+
+    const lastLatency =
+      latencyHistoryMs.length > 0
+        ? latencyHistoryMs[latencyHistoryMs.length - 1]
+        : 0;
+    const telemetry = await computeStorageTelemetry(
+      services.storage,
+      lastLatency,
+      latencyHistoryMs
+    );
+
+    let nextActiveFile = activeFile;
+    if (nextActiveFile && !files[nextActiveFile]) {
+      nextActiveFile = filePaths[0] ?? null;
+    } else if (!nextActiveFile && filePaths.length > 0) {
+      nextActiveFile = filePaths.includes('README.md')
+        ? 'README.md'
+        : filePaths[0];
+    }
+
+    set({
+      files,
+      filePaths,
+      activeFile: nextActiveFile,
+      refs,
+      commits,
+      status,
+      diffs,
+      telemetry,
+      quota,
+      peerCount: services.bridge.getPeerCount(),
+      canUndoActive: nextActiveFile
+        ? services.undoManager.canUndo(nextActiveFile)
+        : false,
+      canRedoActive: nextActiveFile
+        ? services.undoManager.canRedo(nextActiveFile)
+        : false,
+    });
+
+    // Keep the IndexedDB inverted search index incrementally synchronized
+    void services.searchEngine
+      .syncIndex()
+      .then((searchStats) => {
+        if (get().services === services) {
+          set({ searchStats });
+        }
+      })
+      .catch(() => undefined);
+  },
+
+  selectCommitForInspect: async (commitHash) => {
+    const { services } = get();
+    if (!services || !commitHash) {
+      set({ selectedCommitHash: null, selectedCommitDiffs: [] });
+      return;
+    }
+
+    const commit = await services.repo.getCommit(commitHash);
+    if (!commit) {
+      set({ selectedCommitHash: null, selectedCommitDiffs: [] });
+      return;
+    }
+
+    let parentTreeHash: string | null = null;
+    if (commit.parentHashes.length > 0) {
+      const parent = await services.repo.getCommit(commit.parentHashes[0]);
+      parentTreeHash = parent?.treeHash ?? null;
+    }
+
+    const diffs = await diffTrees(
+      services.storage,
+      parentTreeHash,
+      commit.treeHash
+    );
+    set({
+      selectedCommitHash: commitHash,
+      selectedCommitDiffs: diffs,
+    });
+  },
+
+  openCommitInXRay: async (commitHash) => {
+    set({ xrayOpen: true });
+    await get().refreshState();
+    await get().selectCommitForInspect(commitHash);
+  },
+
+  simulateSampleEdit: () => {
+    const { services, files, pendingMerge } = get();
+    if (!services) return;
+    if (pendingMerge) {
+      set({ viewMode: 'diff' });
+      return;
+    }
+    const target = files['docs/storage-quota.md']
+      ? 'docs/storage-quota.md'
+      : get().filePaths[0];
+    if (!target) return;
+    const current = files[target] ?? '';
+    const marker = '\n- **Verified Snapshot**: Tested local CAS persistence and Myers diff.\n';
+    const nextContent = current.includes('**Verified Snapshot**')
+      ? `${current.trimEnd()}\n- **Edit Timestamp**: ${new Date().toLocaleTimeString()}\n`
+      : `${current.trimEnd()}\n${marker}`;
+    services.workingTree.updateFileContent(target, nextContent, LOCAL_EDIT_ORIGIN);
+    set({
+      activeFile: target,
+      viewMode: 'diff',
+      notice: {
+        type: 'info',
+        message: `Edited ${target} — inspect the Myers diff or enter a commit message above.`,
+      },
+    });
+    void get().refreshState();
+  },
+
+  exportSnapshot: () => {
+    const { files, refs, commits, telemetry } = get();
+    return JSON.stringify(
+      {
+        exportedAt: new Date().toISOString(),
+        app: 'Chronicle',
+        refs,
+        telemetry,
+        commits,
+        workingTreeFiles: files,
+      },
+      null,
+      2
+    );
+  },
+
+  createFile: (path, content = '') => {
+    const { services } = get();
+    if (!services) return;
+    try {
+      const normalized = path.trim().replace(/^\/+/, '');
+      services.workingTree.createFile(normalized, content);
+      set({
+        activeFile: normalized,
+        viewMode: 'editor',
+        notice: { type: 'success', message: `Created ${normalized}` },
+      });
+      void get().refreshState();
+    } catch (err) {
+      set({
+        notice: {
+          type: 'error',
+          message: err instanceof Error ? err.message : 'Could not create file.',
+        },
+      });
+    }
+  },
+
+  renameFile: (oldPath, newPath) => {
+    const { services, activeFile } = get();
+    if (!services) return false;
+    try {
+      const target = newPath.trim().replace(/^\/+/, '');
+      services.workingTree.renameFile(oldPath, target);
+      set({
+        activeFile: activeFile === oldPath ? target : activeFile,
+        notice: { type: 'success', message: `Renamed ${oldPath} → ${target}` },
+      });
+      void get().refreshState();
+      return true;
+    } catch (err) {
+      set({
+        notice: {
+          type: 'error',
+          message: err instanceof Error ? err.message : 'Could not rename file.',
+        },
+      });
+      return false;
+    }
+  },
+
+  deleteFile: (path) => {
+    const { services } = get();
+    if (!services) return;
+    services.workingTree.deleteFile(path);
+    set({
+      notice: { type: 'info', message: `Removed ${path} from working tree` },
+    });
+    void get().refreshState();
+  },
+
+  undoActiveFile: () => {
+    const { services, activeFile } = get();
+    if (!services || !activeFile) return;
+    services.undoManager.undo(activeFile);
+    void get().refreshState();
+  },
+
+  redoActiveFile: () => {
+    const { services, activeFile } = get();
+    if (!services || !activeFile) return;
+    services.undoManager.redo(activeFile);
+    void get().refreshState();
+  },
+
+  commitChanges: async (message) => {
+    const { services, files, pendingMerge, status } = get();
+    if (!services) return false;
+    if (pendingMerge) {
+      set({
+        notice: {
+          type: 'error',
+          message:
+            'Merge in progress. Resolve conflicts and click Commit Merge in Diff view.',
+        },
+      });
+      return false;
+    }
+    if (status.clean) {
+      set({
+        notice: { type: 'info', message: 'Working tree is clean — nothing to commit.' },
+      });
+      return false;
+    }
+
+    try {
+      const commit = await services.repo.commit(files, message, get().authorName);
+      const branchLabel =
+        get().refs?.head.type === 'branch'
+          ? (get().refs?.head as { type: 'branch'; branch: string }).branch
+          : 'HEAD';
+      services.bridge.broadcastBranchChange(branchLabel, commit.hash);
+      await get().refreshState();
+      set({
+        notice: {
+          type: 'success',
+          message: `Committed ${commit.hash.slice(0, 7)}: ${commit.message}`,
+        },
+      });
+      return true;
+    } catch (err) {
+      set({
+        notice: {
+          type: 'error',
+          message: err instanceof Error ? err.message : 'Commit failed.',
+        },
+      });
+      return false;
+    }
+  },
+
+  createBranch: async (name) => {
+    const { services } = get();
+    if (!services) return false;
+    try {
+      await services.repo.createBranch(name);
+      await get().refreshState();
+      set({
+        notice: { type: 'success', message: `Created branch "${name.trim()}"` },
+      });
+      return true;
+    } catch (err) {
+      set({
+        notice: {
+          type: 'error',
+          message: err instanceof Error ? err.message : 'Branch creation failed.',
+        },
+      });
+      return false;
+    }
+  },
+
+  deleteBranch: async (name, force = false) => {
+    const { services } = get();
+    if (!services) return 'error';
+    try {
+      await services.repo.deleteBranch(name, force);
+      await get().refreshState();
+      set({
+        notice: {
+          type: 'info',
+          message: `Deleted branch "${name}"${force ? ' (forced)' : ''}.`,
+        },
+      });
+      return 'deleted';
+    } catch (err) {
+      if (err instanceof UnmergedBranchError) {
+        return 'unmerged';
+      }
+      set({
+        notice: {
+          type: 'error',
+          message: err instanceof Error ? err.message : 'Could not delete branch.',
+        },
+      });
+      return 'error';
+    }
+  },
+
+  checkoutTarget: async (branchOrHash) => {
+    const { services, files, pendingMerge } = get();
+    if (!services) return false;
+    try {
+      const result = await services.repo.checkout(
+        branchOrHash,
+        files,
+        pendingMerge
+      );
+      services.workingTree.hydrateFromTree(result.files);
+      services.bridge.broadcastBranchChange(branchOrHash, result.commitHash);
+      await get().refreshState();
+      set({
+        notice: { type: 'info', message: `Switched to ${branchOrHash}` },
+      });
+      return true;
+    } catch (err) {
+      set({
+        notice: {
+          type: 'error',
+          message: err instanceof Error ? err.message : 'Checkout blocked.',
+        },
+      });
+      return false;
+    }
+  },
+
+  mergeBranch: async (targetBranch) => {
+    const { services, files, pendingMerge, authorName } = get();
+    if (!services) return null;
+    try {
+      const result = await services.repo.merge(
+        targetBranch,
+        files,
+        authorName,
+        pendingMerge
+      );
+
+      if (result.outcome === 'ALREADY_UP_TO_DATE') {
+        set({
+          notice: {
+            type: 'info',
+            message: `Already up to date with "${targetBranch}".`,
+          },
+        });
+        return result.outcome;
+      }
+
+      if (result.outcome === 'FAST_FORWARD') {
+        services.workingTree.hydrateFromTree(result.files);
+        await get().refreshState();
+        set({
+          notice: {
+            type: 'success',
+            message: `Fast-forwarded to "${targetBranch}".`,
+          },
+        });
+        return result.outcome;
+      }
+
+      if (result.outcome === 'MERGED_CLEAN') {
+        services.workingTree.hydrateFromTree(result.files);
+        await get().refreshState();
+        set({
+          notice: {
+            type: 'success',
+            message: `Merged "${targetBranch}" cleanly (2-parent merge commit created).`,
+          },
+        });
+        return result.outcome;
+      }
+
+      // CONFLICT
+      services.workingTree.hydrateFromTree(result.files);
+      const nextPending = result.pendingMerge ?? null;
+      await services.storage.setMeta(PENDING_MERGE_META_KEY, nextPending);
+      set({
+        pendingMerge: nextPending,
+        viewMode: 'diff',
+        activeFile: nextPending?.conflictedFiles[0] ?? get().activeFile,
+        notice: {
+          type: 'error',
+          message: `Merge conflict in ${nextPending?.conflictedFiles.join(', ')}. Resolve conflicts in Diff view.`,
+        },
+      });
+      await get().refreshState();
+      return result.outcome;
+    } catch (err) {
+      set({
+        notice: {
+          type: 'error',
+          message: err instanceof Error ? err.message : 'Merge failed.',
+        },
+      });
+      return null;
+    }
+  },
+
+  resolveConflict: (path, regionIndex, choice) => {
+    const { services, files } = get();
+    if (!services) return;
+    const current = files[path];
+    if (current === undefined) return;
+    const resolved = resolveConflictRegion(current, regionIndex, choice);
+    services.workingTree.updateFileContent(path, resolved, LOCAL_EDIT_ORIGIN);
+    void get().refreshState();
+  },
+
+  completeMerge: async (message) => {
+    const { services, files, pendingMerge } = get();
+    if (!services || !pendingMerge) return false;
+
+    for (const [path, content] of Object.entries(files)) {
+      if (hasConflictMarkers(content)) {
+        set({
+          notice: {
+            type: 'error',
+            message: `Unresolved conflict markers remain in ${path}.`,
+          },
+        });
+        return false;
+      }
+    }
+
+    try {
+      const commit = await services.repo.completeMergeCommit(
+        files,
+        pendingMerge,
+        message,
+        get().authorName
+      );
+      await services.storage.setMeta(PENDING_MERGE_META_KEY, null);
+      const branchLabel =
+        get().refs?.head.type === 'branch'
+          ? (get().refs?.head as { type: 'branch'; branch: string }).branch
+          : 'HEAD';
+      services.bridge.broadcastBranchChange(branchLabel, commit.hash);
+      set({
+        pendingMerge: null,
+        viewMode: 'editor',
+        notice: {
+          type: 'success',
+          message: `Merge committed (${commit.hash.slice(0, 7)})`,
+        },
+      });
+      await get().refreshState();
+      return true;
+    } catch (err) {
+      set({
+        notice: {
+          type: 'error',
+          message: err instanceof Error ? err.message : 'Merge commit failed.',
+        },
+      });
+      return false;
+    }
+  },
+
+  abortMerge: async () => {
+    const { services } = get();
+    if (!services) return;
+    const headFiles = await services.repo.abortMerge();
+    services.workingTree.hydrateFromTree(headFiles);
+    await services.storage.setMeta(PENDING_MERGE_META_KEY, null);
+    set({
+      pendingMerge: null,
+      viewMode: 'editor',
+      notice: { type: 'info', message: 'Merge aborted; working tree restored to HEAD.' },
+    });
+    await get().refreshState();
+  },
+
+  resetDemo: async () => {
+    const prevServices = get().services;
+    if (refreshTimer) {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
+    unsubFilesChange?.();
+    unsubFilesChange = null;
+    set({ loading: true, services: null });
+
+    try {
+      if (prevServices) {
+        prevServices.bridge.destroy();
+        prevServices.undoManager.destroy();
+        await prevServices.workingTree.clearDocument();
+        prevServices.workingTree.destroy();
+        await prevServices.searchStorage.clear();
+        prevServices.searchStorage.close();
+        await prevServices.storage.clear();
+        prevServices.storage.close();
+      }
+
+      const recordLatency = (ms: number) => {
+        const rounded = Number(ms.toFixed(2));
+        set((state) => ({
+          latencyHistoryMs: [...state.latencyHistoryMs.slice(-19), rounded],
+        }));
+      };
+
+      const scheduleRefresh = () => {
+        if (refreshTimer) clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(() => {
+          void get().refreshState();
+        }, 16);
+      };
+
+      const activeMeta = getRegistry().getActiveWorkspace();
+      const dbNames = getWorkspaceDBNames(activeMeta.id);
+
+      const storage = new IndexedDBObjectStorage(dbNames.casDbName);
+      const workingTree = new WorkingTreeDoc({ docName: dbNames.crdtDocName });
+      await workingTree.whenSynced;
+
+      const services = await finishServicesSetup(
+        activeMeta,
+        getRegistry().getAuthorName(),
+        dbNames,
+        storage,
+        workingTree,
+        true,
+        recordLatency,
+        scheduleRefresh,
+        () => void get().refreshState(),
+        () => {
+          const current = get().services;
+          if (current) set({ peerCount: current.bridge.getPeerCount() });
+        }
+      );
+
+      set({
+        services,
+        pendingMerge: null,
+        selectedCommitHash: null,
+        selectedCommitDiffs: [],
+        searchQuery: '',
+        searchResults: [],
+        viewMode: 'editor',
+        loading: false,
+        notice: {
+          type: 'success',
+          message:
+            activeMeta.kind === 'demo'
+              ? 'Workspace reset to initial 5-commit demo repository.'
+              : `Reset "${activeMeta.name}" to a clean initial commit.`,
+        },
+      });
+
+      await get().refreshState();
+      const paths = get().filePaths;
+      if (paths.length > 0) {
+        get().setActiveFile(paths.includes('README.md') ? 'README.md' : paths[0]);
+      }
+    } catch (err) {
+      set({
+        loading: false,
+        notice: {
+          type: 'error',
+          message: err instanceof Error ? err.message : 'Reset failed.',
+        },
+      });
+    }
   },
 }));
-
-/** Exposed for component-level subscriptions that must not re-render the store. */
-export function getWorkspaceServices(): WorkspaceServices | null {
-  return services;
-}

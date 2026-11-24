@@ -1,780 +1,546 @@
-/**
- * Git-semantics repository orchestration over the CAS object store and a live
- * working tree adapter.
- *
- * Invariant 4: checkout and merge refuse to destroy uncommitted work unless
- * explicitly forced. Invariant 5: every non-fast-forward merge computes its
- * base through dag.findLCA before invoking the three-way merge.
- */
-
-import { hashObjectPayload, isSha256Hash, utf8ByteLength } from "../cas/hash";
-import type { IObjectStorage } from "../cas/ObjectStore";
-import { findConflictMarkerPaths } from "../merge/conflictParser";
-import { threeWayMerge } from "../merge/threeWayMerge";
+import {
+  createBlobObject,
+  createCommitObject,
+  createTreeObject,
+} from '../cas/hash';
+import type { IObjectStorage } from '../cas/ObjectStore';
 import type {
-  BlobObject,
+  CASObject,
   CommitObject,
   MergeOutcome,
+  PendingMergeState,
   RefState,
-  Sha256Hash,
-  StoredObject,
-  TreeObject,
-  WorkingFileDiff,
-} from "../types";
-import { findLCA, getCommit, getCommitHistory, isAncestor } from "./dag";
-import { diffFileMaps, loadTreeFiles } from "./diff";
-import type { DiffOptions } from "./diff";
-import {
-  BranchAlreadyExistsError,
-  BranchNotFoundError,
-  DetachedHeadError,
-  DirtyWorkingTreeError,
-  InvalidBranchNameError,
-  InvalidWorkingTreeError,
-  MergeInProgressError,
-  MergeTargetMovedError,
-  NoHeadError,
-  NoPendingMergeError,
-  NothingToCommitError,
-  RevisionNotFoundError,
-  UnresolvedConflictsError,
-  UnrelatedHistoriesError,
-  VcsError,
-} from "./errors";
+  WorkingTreeStatus,
+} from '../types';
+import { findLCA, getCommitHistory, isAncestor } from './dag';
+import { diffFileMaps, loadTreeFiles } from './diff';
+import { hasConflictMarkers } from './merge/conflictParser';
+import { threeWayMergeFiles } from './merge/threeWayMerge';
 
-/**
- * The live working tree facade. Phase 3's Yjs WorkingTreeDoc implements this
- * adapter; tests can use a plain object-backed implementation.
- */
-export interface IWorkingTree {
-  readFiles():
-    | Readonly<Record<string, string>>
-    | Promise<Readonly<Record<string, string>>>;
-  hydrateFromTree(
-    files: Readonly<Record<string, string>>,
-  ): void | Promise<void>;
-}
-
-export interface RepositoryOptions {
-  storage: IObjectStorage;
-  workingTree: IWorkingTree;
-  author?: string;
-  defaultBranch?: string;
-  /** Injectable clock for deterministic commit hashes in tests. */
-  now?: () => number;
-}
-
-export interface CommitOptions {
-  message: string;
-  author?: string;
-  allowEmpty?: boolean;
-}
-
-export interface CheckoutOptions {
-  force?: boolean;
-}
-
-export interface MergeOptions {
-  message?: string;
-  author?: string;
-  force?: boolean;
-}
-
-export interface CompleteMergeOptions {
-  message?: string;
-  author?: string;
-  /** Final file contents; defaults to the current working tree. */
-  files?: Readonly<Record<string, string>>;
-}
-
-export interface ResetOptions {
-  hard?: boolean;
-}
-
-export interface LogOptions {
-  limit?: number;
-  from?: string;
-}
-
-/** In-memory merge session; cleared by completeMergeCommit or abortMerge. */
-export interface PendingMergeState {
-  sourceBranch: string;
-  targetBranch: string;
-  baseCommitHash: Sha256Hash;
-  sourceCommitHash: Sha256Hash;
-  targetCommitHash: Sha256Hash;
-  conflictPaths: string[];
-}
-
-const BRANCH_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
-
-function validateBranchName(name: string): void {
-  if (
-    name === "" ||
-    name.length > 255 ||
-    !BRANCH_NAME_PATTERN.test(name) ||
-    name === "HEAD" ||
-    name.includes("..") ||
-    name.includes("//") ||
-    name.endsWith("/") ||
-    name.endsWith(".") ||
-    name.endsWith(".lock")
-  ) {
-    throw new InvalidBranchNameError(name);
+export class DirtyWorkingTreeError extends Error {
+  constructor(message = 'Working tree has uncommitted changes. Commit or reset before switching branches or merging.') {
+    super(message);
+    this.name = 'DirtyWorkingTreeError';
   }
 }
 
-function validateFilePath(path: string): void {
-  if (
-    path === "" ||
-    path.startsWith("/") ||
-    path.endsWith("/") ||
-    path.includes("\\") ||
-    path.includes("\0") ||
-    path === "__proto__"
-  ) {
-    throw new InvalidWorkingTreeError(
-      `Invalid file path ${JSON.stringify(path)}: paths must be relative POSIX paths`,
+export class UnmergedBranchError extends Error {
+  constructor(branchName: string) {
+    super(
+      `Branch "${branchName}" contains unmerged commits. Force delete to discard the branch pointer.`
     );
+    this.name = 'UnmergedBranchError';
   }
-
-  for (const segment of path.split("/")) {
-    if (
-      segment === "" ||
-      segment === "." ||
-      segment === ".." ||
-      segment === "__proto__"
-    ) {
-      throw new InvalidWorkingTreeError(
-        `Invalid file path ${JSON.stringify(path)}: path segments must name files or directories`,
-      );
-    }
-  }
-}
-
-function normalizeFiles(
-  files: Readonly<Record<string, string>>,
-): Record<string, string> {
-  const entries: Array<[string, string]> = [];
-
-  for (const [path, content] of Object.entries(files)) {
-    validateFilePath(path);
-    if (typeof content !== "string") {
-      throw new InvalidWorkingTreeError(
-        `File ${JSON.stringify(path)} must have string content`,
-      );
-    }
-    entries.push([path, content]);
-  }
-
-  entries.sort(([left], [right]) =>
-    left < right ? -1 : left > right ? 1 : 0,
-  );
-
-  const normalized: Record<string, string> = {};
-  for (const [path, content] of entries) {
-    normalized[path] = content;
-  }
-  return normalized;
-}
-
-function compareBranches(refs: RefState): Record<string, Sha256Hash> {
-  return { ...refs.branches };
 }
 
 export class Repository {
-  readonly storage: IObjectStorage;
-  readonly workingTree: IWorkingTree;
+  private storage: IObjectStorage;
+  private onWriteLatency?: (latencyMs: number) => void;
 
-  private readonly author: string;
-  private readonly defaultBranch: string;
-  private readonly now: () => number;
-  private pendingMerge: PendingMergeState | null = null;
-
-  constructor(options: RepositoryOptions) {
-    this.storage = options.storage;
-    this.workingTree = options.workingTree;
-    this.author = options.author?.trim() || "Chronicle User";
-    this.defaultBranch = options.defaultBranch ?? "main";
-    validateBranchName(this.defaultBranch);
-    this.now = options.now ?? (() => Date.now());
+  constructor(
+    storage: IObjectStorage,
+    onWriteLatency?: (latencyMs: number) => void
+  ) {
+    this.storage = storage;
+    this.onWriteLatency = onWriteLatency;
   }
 
-  /**
-   * Loads the repository head. A brand-new workspace has no commits and no
-   * RefState yet; the first commit creates the default branch as its root.
-   */
-  async init(): Promise<RefState | null> {
-    return this.storage.getRefs();
-  }
-
-  async getRefs(): Promise<RefState | null> {
-    return this.storage.getRefs();
-  }
-
-  async getActiveBranch(): Promise<string | null> {
+  async isInitialized(): Promise<boolean> {
     const refs = await this.storage.getRefs();
-    return refs?.head.type === "branch" ? refs.head.name : null;
+    return refs !== null;
   }
 
-  async listBranches(): Promise<Record<string, Sha256Hash>> {
-    const refs = await this.storage.getRefs();
-    return refs ? compareBranches(refs) : {};
-  }
-
-  getPendingMerge(): PendingMergeState | null {
-    if (!this.pendingMerge) return null;
-    return {
-      ...this.pendingMerge,
-      conflictPaths: [...this.pendingMerge.conflictPaths],
-    };
-  }
-
-  async getHeadCommit(): Promise<CommitObject | null> {
-    const hash = this.headHash(await this.storage.getRefs());
-    return hash ? getCommit(this.storage, hash) : null;
-  }
-
-  async resolveRevision(revision: string): Promise<Sha256Hash> {
-    const refs = await this.storage.getRefs();
-
-    if (revision === "HEAD") {
-      const hash = this.headHash(refs);
-      if (!hash) throw new NoHeadError();
-      return hash;
-    }
-
-    if (refs && Object.prototype.hasOwnProperty.call(refs.branches, revision)) {
-      const hash = refs.branches[revision];
-      if (hash) return hash;
-    }
-
-    if (isSha256Hash(revision) && (await this.storage.hasObject(revision))) {
-      return revision;
-    }
-
-    throw new RevisionNotFoundError(revision);
-  }
-
-  /** Compares the working tree (or any supplied map) against HEAD. */
-  async status(options: DiffOptions = {}): Promise<WorkingFileDiff[]> {
-    const refs = await this.storage.getRefs();
-    const workingFiles = await this.readWorkingFiles();
-    const baseHash = this.headHash(refs);
-
-    if (!baseHash) {
-      return diffFileMaps({}, workingFiles, options);
-    }
-
-    const baseFiles = await loadTreeFiles(this.storage, baseHash);
-    return diffFileMaps(baseFiles, workingFiles, options);
-  }
-
-  async log(options: LogOptions = {}): Promise<CommitObject[]> {
-    const hash = options.from
-      ? await this.resolveRevision(options.from)
-      : this.headHash(await this.storage.getRefs());
-
-    if (!hash) return [];
-    return getCommitHistory(this.storage, hash, { limit: options.limit });
-  }
-
-  async createBranch(
-    name: string,
-    options: { from?: string } = {},
-  ): Promise<Sha256Hash> {
-    validateBranchName(name);
-    this.ensureNoMerge("create a branch");
-
-    const refs = await this.storage.getRefs();
-    if (!refs) throw new NoHeadError();
-
-    const fromHash = options.from
-      ? await this.resolveRevision(options.from)
-      : this.headHash(refs);
-    if (!fromHash) throw new NoHeadError();
-
-    // Fail before mutating refs if the revision is not a commit.
-    await getCommit(this.storage, fromHash);
-
-    await this.storage.updateRefs((current) => {
-      if (!current) throw new NoHeadError();
-      if (
-        Object.prototype.hasOwnProperty.call(current.branches, name)
-      ) {
-        throw new BranchAlreadyExistsError(name);
-      }
-      return {
-        ...current,
-        branches: { ...current.branches, [name]: fromHash },
-      };
-    });
-
-    return fromHash;
-  }
-
-  async checkout(
-    branchName: string,
-    options: CheckoutOptions = {},
-  ): Promise<RefState> {
-    validateBranchName(branchName);
-    this.ensureNoMerge("switch branches");
-
-    const refs = await this.storage.getRefs();
-    if (!refs) throw new NoHeadError();
-
-    const targetHash = refs.branches[branchName];
-    if (!targetHash) throw new BranchNotFoundError(branchName);
-
-    const targetCommit = await getCommit(this.storage, targetHash);
-    const targetFiles = await loadTreeFiles(this.storage, targetCommit.treeHash);
-
-    if (!options.force) {
-      await this.assertCleanWorkingTree(`switch to ${branchName}`);
-    }
-
-    const nextRefs = await this.storage.updateRefs((current) => {
-      if (!current) throw new NoHeadError();
-      if (!current.branches[branchName]) {
-        throw new BranchNotFoundError(branchName);
-      }
-      return {
-        ...current,
-        head: { type: "branch", name: branchName },
-      };
-    });
-
-    await this.hydrateWorkingTree(targetFiles);
-    return nextRefs;
-  }
-
-  async commit(options: CommitOptions): Promise<CommitObject> {
-    this.ensureNoMerge("create a normal commit");
-
-    const message = options.message.trim();
-    if (message === "") {
-      throw new VcsError("Commit message must not be empty");
-    }
-    const author = (options.author ?? this.author).trim();
-    if (author === "") {
-      throw new VcsError("Commit author must not be empty");
-    }
-
-    const refs = await this.storage.getRefs();
-    const headHash = this.headHash(refs);
-    const headCommit = headHash
-      ? await getCommit(this.storage, headHash)
-      : null;
-
-    const files = await this.readWorkingFiles();
-    const { tree, blobs } = await this.buildTreeSnapshot(files);
-
-    if (
-      headCommit &&
-      headCommit.treeHash === tree.hash &&
-      !options.allowEmpty
-    ) {
-      throw new NothingToCommitError();
-    }
-
-    const commit = await this.createCommit({
-      treeHash: tree.hash,
-      parentHashes: headCommit ? [headCommit.hash] : [],
-      message,
-      author,
-      timestamp: this.now(),
-    });
-
-    let nextRefs: RefState;
-    if (!refs) {
-      nextRefs = {
-        head: { type: "branch", name: this.defaultBranch },
-        branches: { [this.defaultBranch]: commit.hash },
-      };
-    } else if (refs.head.type === "branch") {
-      nextRefs = {
-        ...refs,
-        branches: { ...refs.branches, [refs.head.name]: commit.hash },
-      };
-    } else {
-      nextRefs = {
-        ...refs,
-        head: { type: "detached", commitHash: commit.hash },
-      };
-    }
-
-    await this.storage.writeBatch({
-      objects: [...blobs, tree, commit],
-      refs: nextRefs,
-    });
-
-    return commit;
-  }
-
-  /**
-   * Merges `sourceBranch` into the current branch.
-   *
-   * - ALREADY_UP_TO_DATE when source is an ancestor of the target
-   * - FAST_FORWARD when the target is an ancestor of source
-   * - MERGED_CLEAN after a successful LCA-based three-way merge commit
-   * - CONFLICT with marker files, leaving a pending merge to complete/abort
-   */
-  async merge(
-    sourceBranch: string,
-    options: MergeOptions = {},
-  ): Promise<MergeOutcome> {
-    validateBranchName(sourceBranch);
-    this.ensureNoMerge("start a merge");
-
-    const refs = await this.storage.getRefs();
-    if (!refs) throw new NoHeadError();
-    if (refs.head.type !== "branch") throw new DetachedHeadError("merge");
-
-    const targetBranch = refs.head.name;
-    const targetHash = refs.branches[targetBranch];
-    if (!targetHash) throw new BranchNotFoundError(targetBranch);
-
-    const sourceHash = refs.branches[sourceBranch];
-    if (!sourceHash) throw new BranchNotFoundError(sourceBranch);
-
-    if (sourceBranch === targetBranch || sourceHash === targetHash) {
-      return { status: "ALREADY_UP_TO_DATE" };
-    }
-
-    if (await isAncestor(this.storage, sourceHash, targetHash)) {
-      return { status: "ALREADY_UP_TO_DATE" };
-    }
-
-    if (!options.force) {
-      await this.assertCleanWorkingTree(
-        `merge ${sourceBranch} into ${targetBranch}`,
-      );
-    }
-
-    if (await isAncestor(this.storage, targetHash, sourceHash)) {
-      const files = await loadTreeFiles(this.storage, sourceHash);
-      const nextRefs: RefState = {
-        ...refs,
-        branches: { ...refs.branches, [targetBranch]: sourceHash },
-      };
-      await this.storage.writeBatch({ refs: nextRefs });
-      await this.hydrateWorkingTree(files);
-      return { status: "FAST_FORWARD", commitHash: sourceHash };
-    }
-
-    const baseCommit = await findLCA(this.storage, targetHash, sourceHash);
-    if (!baseCommit) {
-      throw new UnrelatedHistoriesError(targetHash, sourceHash);
-    }
-
-    const [baseFiles, oursFiles, theirsFiles] = await Promise.all([
-      loadTreeFiles(this.storage, baseCommit.treeHash),
-      loadTreeFiles(this.storage, targetHash),
-      loadTreeFiles(this.storage, sourceHash),
-    ]);
-
-    const mergeResult = threeWayMerge(baseFiles, oursFiles, theirsFiles, {
-      oursLabel: "HEAD",
-      theirsLabel: sourceBranch,
-    });
-
-    if (mergeResult.hasConflicts) {
-      const mergedFiles: Record<string, string> = {
-        ...mergeResult.resolvedFiles,
-      };
-      for (const conflict of mergeResult.conflictFiles) {
-        mergedFiles[conflict.path] = conflict.mergedWithMarkers;
-      }
-
-      await this.hydrateWorkingTree(mergedFiles);
-      this.pendingMerge = {
-        sourceBranch,
-        targetBranch,
-        baseCommitHash: baseCommit.hash,
-        sourceCommitHash: sourceHash,
-        targetCommitHash: targetHash,
-        conflictPaths: mergeResult.conflictFiles.map(
-          (conflict) => conflict.path,
-        ),
-      };
-
-      return {
-        status: "CONFLICT",
-        sourceBranch,
-        targetBranch,
-        baseCommitHash: baseCommit.hash,
-        sourceCommitHash: sourceHash,
-        resolvedFiles: mergeResult.resolvedFiles,
-        conflictFiles: mergeResult.conflictFiles,
-      };
-    }
-
-    const message = (
-      options.message ??
-      `Merge branch '${sourceBranch}' into ${targetBranch}`
-    ).trim();
-    const author = (options.author ?? this.author).trim();
-
-    const commit = await this.commitMergedSnapshot({
-      files: mergeResult.resolvedFiles,
-      parentHashes: [targetHash, sourceHash],
-      message,
-      author,
-      targetBranch,
-      expectedTargetHash: targetHash,
-    });
-
-    await this.hydrateWorkingTree(mergeResult.resolvedFiles);
-
-    return { status: "MERGED_CLEAN", commitHash: commit.hash };
-  }
-
-  /**
-   * Finalizes a conflicted merge. By default the current working tree is
-   * committed, allowing the editor to resolve markers in place; an explicit
-   * `files` snapshot is accepted for programmatic resolution.
-   */
-  async completeMergeCommit(
-    options: CompleteMergeOptions = {},
+  async init(
+    initialFiles: Record<string, string> = {},
+    author = 'Chronicle Author',
+    message = 'Initial commit',
+    timestamp = Date.now()
   ): Promise<CommitObject> {
-    const pending = this.pendingMerge;
-    if (!pending) throw new NoPendingMergeError();
-
-    const refs = await this.storage.getRefs();
-    if (
-      !refs ||
-      refs.head.type !== "branch" ||
-      refs.head.name !== pending.targetBranch
-    ) {
-      throw new MergeInProgressError(
-        `HEAD is no longer on ${JSON.stringify(pending.targetBranch)}`,
-      );
-    }
-
-    const files =
-      options.files !== undefined
-        ? normalizeFiles(options.files)
-        : await this.readWorkingFiles();
-
-    const unresolved = findConflictMarkerPaths(files);
-    if (unresolved.length > 0) {
-      throw new UnresolvedConflictsError(unresolved);
-    }
-
-    const message = (
-      options.message ??
-      `Merge branch '${pending.sourceBranch}' into ${pending.targetBranch}`
-    ).trim();
-    const author = (options.author ?? this.author).trim();
-
-    const commit = await this.commitMergedSnapshot({
-      files,
-      parentHashes: [pending.targetCommitHash, pending.sourceCommitHash],
+    const { objectsToWrite, treeHash } = await this.buildTreeObjects(initialFiles);
+    const commit = await createCommitObject({
+      treeHash,
+      parentHashes: [],
       message,
       author,
-      targetBranch: pending.targetBranch,
-      expectedTargetHash: pending.targetCommitHash,
+      timestamp,
     });
+    objectsToWrite.push(commit);
 
-    await this.hydrateWorkingTree(files);
-    this.pendingMerge = null;
+    const refs: RefState = {
+      head: { type: 'branch', branch: 'main' },
+      branches: { main: commit.hash },
+    };
+
+    const latency = await this.storage.writeBatch(objectsToWrite, refs);
+    this.onWriteLatency?.(latency);
     return commit;
   }
 
-  /** Discards an in-progress conflicted merge and restores the target tree. */
-  async abortMerge(): Promise<void> {
-    const pending = this.pendingMerge;
-    if (!pending) throw new NoPendingMergeError();
-
+  async getRefs(): Promise<RefState> {
     const refs = await this.storage.getRefs();
-    const targetHash =
-      refs?.branches[pending.targetBranch] ?? pending.targetCommitHash;
-    const files = await loadTreeFiles(this.storage, targetHash);
-
-    await this.hydrateWorkingTree(files);
-    this.pendingMerge = null;
-  }
-
-  /**
-   * Moves the current branch (or detached HEAD) to a commit. Soft reset keeps
-   * the working tree; hard reset replaces it with the target snapshot.
-   */
-  async reset(
-    commitHash: Sha256Hash,
-    options: ResetOptions = {},
-  ): Promise<RefState> {
-    const commit = await getCommit(this.storage, commitHash);
-    const refs = await this.storage.getRefs();
-    if (!refs) throw new NoHeadError();
-
-    const nextRefs: RefState =
-      refs.head.type === "branch"
-        ? {
-            ...refs,
-            branches: { ...refs.branches, [refs.head.name]: commit.hash },
-          }
-        : {
-            ...refs,
-            head: { type: "detached", commitHash: commit.hash },
-          };
-
-    await this.storage.writeBatch({ refs: nextRefs });
-
-    if (options.hard) {
-      const files = await loadTreeFiles(this.storage, commit.treeHash);
-      await this.hydrateWorkingTree(files);
+    if (!refs) {
+      throw new Error('Repository is not initialized.');
     }
-
-    this.pendingMerge = null;
-    return nextRefs;
+    return refs;
   }
 
-  // -------------------------------------------------------------------------
-  // Internals
-  // -------------------------------------------------------------------------
-
-  private headHash(refs: RefState | null): Sha256Hash | null {
+  async getHeadCommitHash(): Promise<string | null> {
+    const refs = await this.storage.getRefs();
     if (!refs) return null;
-    if (refs.head.type === "detached") return refs.head.commitHash;
-
-    const hash = refs.branches[refs.head.name];
-    if (!hash) throw new BranchNotFoundError(refs.head.name);
-    return hash;
-  }
-
-  private ensureNoMerge(action: string): void {
-    if (this.pendingMerge) {
-      throw new MergeInProgressError(
-        `Cannot ${action} while a merge is in progress; complete or abort it first`,
-      );
+    if (refs.head.type === 'branch') {
+      return refs.branches[refs.head.branch] ?? null;
     }
+    return refs.head.commitHash;
   }
 
-  private async readWorkingFiles(): Promise<Record<string, string>> {
-    return normalizeFiles(await this.workingTree.readFiles());
+  async getCommit(hash: string): Promise<CommitObject | null> {
+    const obj = await this.storage.getObject(hash);
+    if (!obj || obj.type !== 'commit') return null;
+    return obj;
   }
 
-  private async hydrateWorkingTree(
-    files: Readonly<Record<string, string>>,
-  ): Promise<void> {
-    await this.workingTree.hydrateFromTree(normalizeFiles(files));
+  async getCommitTreeFiles(commitHash: string | null): Promise<Record<string, string>> {
+    if (!commitHash) return {};
+    const commit = await this.getCommit(commitHash);
+    if (!commit) return {};
+    return loadTreeFiles(this.storage, commit.treeHash);
   }
 
-  private async assertCleanWorkingTree(action: string): Promise<void> {
-    const changes = await this.status({ includeUnmodified: false });
-    if (changes.length > 0) {
-      throw new DirtyWorkingTreeError(
-        changes.map((change) => change.path),
-        action,
-      );
-    }
+  async getHeadFiles(): Promise<Record<string, string>> {
+    const headHash = await this.getHeadCommitHash();
+    return this.getCommitTreeFiles(headHash);
   }
 
-  private async buildTreeSnapshot(
-    files: Readonly<Record<string, string>>,
-  ): Promise<{ tree: TreeObject; blobs: StoredObject[] }> {
-    const normalized = normalizeFiles(files);
-    const blobs: StoredObject[] = [];
-    const blobsByHash = new Map<Sha256Hash, BlobObject>();
-    const entries: Record<string, Sha256Hash> = {};
+  async status(
+    workingFiles: Record<string, string>,
+    pendingMerge?: PendingMergeState | null
+  ): Promise<WorkingTreeStatus> {
+    const headFiles = await this.getHeadFiles();
+    const diffs = diffFileMaps(headFiles, workingFiles);
 
-    for (const [path, content] of Object.entries(normalized)) {
-      const payload = {
-        type: "blob" as const,
-        content,
-        byteLength: utf8ByteLength(content),
-      };
-      const hash = await hashObjectPayload(payload);
+    const modified: string[] = [];
+    const added: string[] = [];
+    const deleted: string[] = [];
+    const conflicted: string[] = [];
+    const changes: WorkingTreeStatus['changes'] = {};
 
-      let blob = blobsByHash.get(hash);
-      if (!blob) {
-        blob = { ...payload, hash };
-        blobsByHash.set(hash, blob);
-        blobs.push(blob);
+    for (const d of diffs) {
+      if (d.status === 'modified') {
+        modified.push(d.path);
+        changes[d.path] = 'modified';
+      } else if (d.status === 'added') {
+        added.push(d.path);
+        changes[d.path] = 'added';
+      } else if (d.status === 'deleted') {
+        deleted.push(d.path);
+        changes[d.path] = 'deleted';
       }
-
-      entries[path] = hash;
     }
 
-    const treePayload = { type: "tree" as const, entries };
-    const treeHash = await hashObjectPayload(treePayload);
-    const tree: TreeObject = { ...treePayload, hash: treeHash };
+    // Check any file containing conflict markers or tracked as pending conflict
+    const allPaths = Array.from(
+      new Set([
+        ...Object.keys(workingFiles),
+        ...(pendingMerge?.conflictedFiles ?? []),
+      ])
+    ).sort();
 
-    return { tree, blobs };
+    for (const path of allPaths) {
+      const content = workingFiles[path];
+      if (content !== undefined && hasConflictMarkers(content)) {
+        conflicted.push(path);
+        changes[path] = 'conflicted';
+      }
+    }
+
+    return {
+      clean:
+        modified.length === 0 &&
+        added.length === 0 &&
+        deleted.length === 0 &&
+        conflicted.length === 0 &&
+        !pendingMerge,
+      modified,
+      added,
+      deleted,
+      conflicted,
+      changes,
+    };
   }
 
-  private async createCommit(input: {
-    treeHash: Sha256Hash;
-    parentHashes: readonly Sha256Hash[];
-    message: string;
-    author: string;
-    timestamp: number;
-  }): Promise<CommitObject> {
-    const timestamp = Math.trunc(input.timestamp);
-    if (!Number.isFinite(timestamp)) {
-      throw new VcsError("Commit timestamp must be a finite number");
+  async assertCleanWorkingTree(
+    workingFiles: Record<string, string>,
+    pendingMerge?: PendingMergeState | null
+  ): Promise<void> {
+    if (pendingMerge) {
+      throw new DirtyWorkingTreeError(
+        'A merge is currently in progress. Resolve conflicts and commit or abort the merge first.'
+      );
+    }
+    const currentStatus = await this.status(workingFiles, pendingMerge);
+    if (!currentStatus.clean) {
+      throw new DirtyWorkingTreeError();
+    }
+  }
+
+  private async buildTreeObjects(
+    files: Record<string, string>
+  ): Promise<{ objectsToWrite: CASObject[]; treeHash: string }> {
+    const objectsToWrite: CASObject[] = [];
+    const entries: Record<string, string> = {};
+
+    const sortedPaths = Object.keys(files).sort();
+    for (const path of sortedPaths) {
+      const blob = await createBlobObject(files[path]);
+      entries[path] = blob.hash;
+      if (!(await this.storage.hasObject(blob.hash))) {
+        objectsToWrite.push(blob);
+      }
     }
 
-    const payload = {
-      type: "commit" as const,
-      treeHash: input.treeHash,
-      parentHashes: [...input.parentHashes],
-      message: input.message,
-      author: input.author,
+    const tree = await createTreeObject(entries);
+    if (!(await this.storage.hasObject(tree.hash))) {
+      objectsToWrite.push(tree);
+    }
+
+    return { objectsToWrite, treeHash: tree.hash };
+  }
+
+  async commit(
+    workingFiles: Record<string, string>,
+    message: string,
+    author = 'Chronicle Author',
+    parentHashesOverride?: string[],
+    timestamp = Date.now()
+  ): Promise<CommitObject> {
+    const trimmed = message.trim();
+    if (!trimmed) {
+      throw new Error('Commit message cannot be empty.');
+    }
+
+    for (const [path, content] of Object.entries(workingFiles)) {
+      if (hasConflictMarkers(content)) {
+        throw new Error(`Unresolved conflict markers remain in ${path}.`);
+      }
+    }
+
+    const refs = await this.getRefs();
+    const headCommitHash = await this.getHeadCommitHash();
+    const parentHashes =
+      parentHashesOverride ?? (headCommitHash ? [headCommitHash] : []);
+
+    const { objectsToWrite, treeHash } = await this.buildTreeObjects(workingFiles);
+    const commit = await createCommitObject({
+      treeHash,
+      parentHashes,
+      message: trimmed,
+      author,
       timestamp,
+    });
+    objectsToWrite.push(commit);
+
+    const nextRefs: RefState = {
+      head: { ...refs.head },
+      branches: { ...refs.branches },
     };
 
-    return { ...payload, hash: await hashObjectPayload(payload) };
+    if (nextRefs.head.type === 'branch') {
+      nextRefs.branches[nextRefs.head.branch] = commit.hash;
+    } else {
+      nextRefs.head = { type: 'detached', commitHash: commit.hash };
+    }
+
+    const latency = await this.storage.writeBatch(objectsToWrite, nextRefs);
+    this.onWriteLatency?.(latency);
+    return commit;
   }
 
-  private async commitMergedSnapshot(input: {
-    files: Readonly<Record<string, string>>;
-    parentHashes: readonly Sha256Hash[];
-    message: string;
-    author: string;
-    targetBranch: string;
-    expectedTargetHash: Sha256Hash;
-  }): Promise<CommitObject> {
-    if (input.message === "") {
-      throw new VcsError("Merge commit message must not be empty");
+  async createBranch(name: string, fromCommitHash?: string): Promise<RefState> {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      throw new Error('Branch name cannot be empty.');
     }
-    if (input.author === "") {
-      throw new VcsError("Merge commit author must not be empty");
+    if (/\s/.test(trimmed)) {
+      throw new Error('Branch name cannot contain whitespace.');
     }
 
-    const { tree, blobs } = await this.buildTreeSnapshot(input.files);
-    const commit = await this.createCommit({
-      treeHash: tree.hash,
-      parentHashes: input.parentHashes,
-      message: input.message,
-      author: input.author,
-      timestamp: this.now(),
-    });
-
-    const refs = await this.storage.getRefs();
-    if (!refs) throw new NoHeadError();
-
-    const currentTarget = refs.branches[input.targetBranch];
-    if (!currentTarget) {
-      throw new BranchNotFoundError(input.targetBranch);
+    const refs = await this.getRefs();
+    if (refs.branches[trimmed]) {
+      throw new Error(`Branch "${trimmed}" already exists.`);
     }
-    if (currentTarget !== input.expectedTargetHash) {
-      throw new MergeTargetMovedError(input.targetBranch);
+
+    const baseHash = fromCommitHash ?? (await this.getHeadCommitHash());
+    if (!baseHash) {
+      throw new Error('Cannot create branch without an existing commit.');
     }
 
     const nextRefs: RefState = {
-      ...refs,
+      head: { ...refs.head },
       branches: {
         ...refs.branches,
-        [input.targetBranch]: commit.hash,
+        [trimmed]: baseHash,
       },
     };
+    await this.storage.setRefs(nextRefs);
+    return nextRefs;
+  }
 
-    await this.storage.writeBatch({
-      objects: [...blobs, tree, commit],
-      refs: nextRefs,
-    });
+  async isBranchMerged(name: string): Promise<boolean> {
+    const refs = await this.getRefs();
+    const targetHash = refs.branches[name];
+    const headHash = await this.getHeadCommitHash();
+    if (!targetHash || !headHash) return false;
+    if (targetHash === headHash) return true;
+    return isAncestor(this.storage, targetHash, headHash);
+  }
 
-    return commit;
+  async deleteBranch(name: string, force = false): Promise<RefState> {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      throw new Error('Branch name cannot be empty.');
+    }
+
+    const refs = await this.getRefs();
+    const targetHash = refs.branches[trimmed];
+    if (!targetHash) {
+      throw new Error(`Branch "${trimmed}" does not exist.`);
+    }
+
+    if (refs.head.type === 'branch' && refs.head.branch === trimmed) {
+      throw new Error(
+        `Cannot delete the active branch "${trimmed}". Switch to another branch first.`
+      );
+    }
+
+    if (!force) {
+      const merged = await this.isBranchMerged(trimmed);
+      if (!merged) {
+        throw new UnmergedBranchError(trimmed);
+      }
+    }
+
+    const nextBranches = { ...refs.branches };
+    delete nextBranches[trimmed];
+    const nextRefs: RefState = {
+      head: { ...refs.head },
+      branches: nextBranches,
+    };
+    await this.storage.setRefs(nextRefs);
+    return nextRefs;
+  }
+
+  async checkout(
+    branchOrHash: string,
+    workingFiles: Record<string, string>,
+    pendingMerge?: PendingMergeState | null
+  ): Promise<{ files: Record<string, string>; refs: RefState; commitHash: string }> {
+    await this.assertCleanWorkingTree(workingFiles, pendingMerge);
+
+    const refs = await this.getRefs();
+    let nextRefs: RefState;
+    let targetCommitHash: string;
+
+    if (refs.branches[branchOrHash]) {
+      targetCommitHash = refs.branches[branchOrHash];
+      nextRefs = {
+        head: { type: 'branch', branch: branchOrHash },
+        branches: { ...refs.branches },
+      };
+    } else {
+      const commit = await this.getCommit(branchOrHash);
+      if (!commit) {
+        throw new Error(`Unknown branch or commit "${branchOrHash}".`);
+      }
+      targetCommitHash = commit.hash;
+      nextRefs = {
+        head: { type: 'detached', commitHash: targetCommitHash },
+        branches: { ...refs.branches },
+      };
+    }
+
+    const files = await this.getCommitTreeFiles(targetCommitHash);
+    await this.storage.setRefs(nextRefs);
+    return { files, refs: nextRefs, commitHash: targetCommitHash };
+  }
+
+  async merge(
+    targetBranch: string,
+    workingFiles: Record<string, string>,
+    author = 'Chronicle Author',
+    pendingMerge?: PendingMergeState | null,
+    timestamp = Date.now()
+  ): Promise<{
+    outcome: MergeOutcome;
+    files: Record<string, string>;
+    commit?: CommitObject;
+    pendingMerge?: PendingMergeState;
+    refs: RefState;
+  }> {
+    await this.assertCleanWorkingTree(workingFiles, pendingMerge);
+
+    const refs = await this.getRefs();
+    const targetHash = refs.branches[targetBranch];
+    if (!targetHash) {
+      throw new Error(`Branch "${targetBranch}" does not exist.`);
+    }
+
+    const headHash = await this.getHeadCommitHash();
+    if (!headHash) {
+      throw new Error('Cannot merge without a HEAD commit.');
+    }
+
+    // 1. Same commit or target is already an ancestor of HEAD -> already up to date
+    if (
+      headHash === targetHash ||
+      (await isAncestor(this.storage, targetHash, headHash))
+    ) {
+      const files = await this.getCommitTreeFiles(headHash);
+      return { outcome: 'ALREADY_UP_TO_DATE', files, refs };
+    }
+
+    // 2. HEAD is an ancestor of target -> Fast-Forward
+    if (await isAncestor(this.storage, headHash, targetHash)) {
+      const nextRefs: RefState = {
+        head: { ...refs.head },
+        branches: { ...refs.branches },
+      };
+      if (nextRefs.head.type === 'branch') {
+        nextRefs.branches[nextRefs.head.branch] = targetHash;
+      } else {
+        nextRefs.head = { type: 'detached', commitHash: targetHash };
+      }
+      await this.storage.setRefs(nextRefs);
+      const files = await this.getCommitTreeFiles(targetHash);
+      return { outcome: 'FAST_FORWARD', files, refs: nextRefs };
+    }
+
+    // 3. True 3-way merge using deterministic LCA
+    const lcaHash = await findLCA(this.storage, headHash, targetHash);
+    const [baseFiles, oursFiles, theirsFiles] = await Promise.all([
+      this.getCommitTreeFiles(lcaHash),
+      this.getCommitTreeFiles(headHash),
+      this.getCommitTreeFiles(targetHash),
+    ]);
+
+    const mergeResult = threeWayMergeFiles(
+      baseFiles,
+      oursFiles,
+      theirsFiles,
+      targetBranch
+    );
+
+    if (mergeResult.clean) {
+      const currentName =
+        refs.head.type === 'branch' ? refs.head.branch : headHash.slice(0, 7);
+      const commit = await this.commit(
+        mergeResult.mergedFiles,
+        `Merge branch '${targetBranch}' into ${currentName}`,
+        author,
+        [headHash, targetHash],
+        timestamp
+      );
+      const nextRefs = await this.getRefs();
+      return {
+        outcome: 'MERGED_CLEAN',
+        files: mergeResult.mergedFiles,
+        commit,
+        refs: nextRefs,
+      };
+    }
+
+    // 4. Conflict -> return merged working files containing conflict markers + pendingMerge
+    return {
+      outcome: 'CONFLICT',
+      files: mergeResult.mergedFiles,
+      pendingMerge: {
+        targetBranch,
+        targetCommitHash: targetHash,
+        lcaCommitHash: lcaHash,
+        conflictedFiles: mergeResult.conflictedFiles,
+      },
+      refs,
+    };
+  }
+
+  async completeMergeCommit(
+    workingFiles: Record<string, string>,
+    pendingMerge: PendingMergeState,
+    message?: string,
+    author = 'Chronicle Author',
+    timestamp = Date.now()
+  ): Promise<CommitObject> {
+    for (const [path, content] of Object.entries(workingFiles)) {
+      if (hasConflictMarkers(content)) {
+        throw new Error(
+          `Cannot complete merge: unresolved conflict markers remain in ${path}.`
+        );
+      }
+    }
+
+    const refs = await this.getRefs();
+    const headHash = await this.getHeadCommitHash();
+    if (!headHash) {
+      throw new Error('Cannot complete merge without HEAD.');
+    }
+
+    const currentName =
+      refs.head.type === 'branch' ? refs.head.branch : headHash.slice(0, 7);
+    const finalMessage =
+      message?.trim() ||
+      `Merge branch '${pendingMerge.targetBranch}' into ${currentName}`;
+
+    return this.commit(
+      workingFiles,
+      finalMessage,
+      author,
+      [headHash, pendingMerge.targetCommitHash],
+      timestamp
+    );
+  }
+
+  async abortMerge(): Promise<Record<string, string>> {
+    return this.getHeadFiles();
+  }
+
+  async reset(
+    targetBranchOrHash: string
+  ): Promise<{ files: Record<string, string>; refs: RefState }> {
+    const refs = await this.getRefs();
+    const targetHash = refs.branches[targetBranchOrHash] ?? targetBranchOrHash;
+    const commit = await this.getCommit(targetHash);
+    if (!commit) {
+      throw new Error(`Cannot reset: commit "${targetBranchOrHash}" not found.`);
+    }
+
+    const nextRefs: RefState = {
+      head: { ...refs.head },
+      branches: { ...refs.branches },
+    };
+
+    if (nextRefs.head.type === 'branch') {
+      nextRefs.branches[nextRefs.head.branch] = commit.hash;
+    } else {
+      nextRefs.head = { type: 'detached', commitHash: commit.hash };
+    }
+
+    await this.storage.setRefs(nextRefs);
+    const files = await this.getCommitTreeFiles(commit.hash);
+    return { files, refs: nextRefs };
+  }
+
+  async log(maxCount?: number): Promise<CommitObject[]> {
+    const headHash = await this.getHeadCommitHash();
+    if (!headHash) return [];
+    return getCommitHistory(this.storage, [headHash], maxCount);
+  }
+
+  async getAllCommits(): Promise<CommitObject[]> {
+    const refs = await this.storage.getRefs();
+    if (!refs) return [];
+    const heads = new Set<string>(Object.values(refs.branches));
+    if (refs.head.type === 'detached') {
+      heads.add(refs.head.commitHash);
+    }
+    return getCommitHistory(this.storage, Array.from(heads));
   }
 }

@@ -1,61 +1,90 @@
+import * as Y from 'yjs';
+import { CHECKOUT_ORIGIN, LOCAL_EDIT_ORIGIN } from './origins';
+
 /**
- * File-scoped undo.
- *
- * A `Y.UndoManager` is created for exactly one `Y.Text`. Only local editor
- * transactions are tracked, so remote BroadcastChannel updates, IndexedDB
- * replays, and atomic checkout/merge hydration are never undoable. The undo
- * stack is also cleared whenever a `"checkout"` transaction arrives, which
- * prevents a stale local edit from being replayed after a branch switch.
+ * Per-file Y.UndoManager wrapper that tracks ONLY LOCAL_EDIT_ORIGIN
+ * and clears its undo/redo stacks whenever a CHECKOUT_ORIGIN transaction fires.
  */
-
-import { UndoManager } from "yjs";
-import type { Doc, Text as YText } from "yjs";
-
-import { CHECKOUT_ORIGIN } from "./WorkingTreeDoc";
-
-/** Origin used by editor keystrokes and `WorkingTreeDoc.setFile`. */
-export const LOCAL_EDIT_ORIGIN = "local";
-
 export class FileUndoManager {
-  readonly manager: UndoManager;
+  private undoManagers = new Map<string, Y.UndoManager>();
+  private doc: Y.Doc;
+  private filesMap: Y.Map<Y.Text>;
+  private unbindTx: () => void;
 
-  private readonly doc: Doc;
-  private readonly onUpdate: (update: Uint8Array, origin: unknown) => void;
-
-  constructor(doc: Doc, text: YText) {
+  constructor(doc: Y.Doc, filesMap: Y.Map<Y.Text>) {
     this.doc = doc;
-    this.manager = new UndoManager(text, {
-      trackedOrigins: new Set([LOCAL_EDIT_ORIGIN]),
-    });
+    this.filesMap = filesMap;
 
-    this.onUpdate = (_update: Uint8Array, origin: unknown) => {
-      if (origin === CHECKOUT_ORIGIN) this.manager.clear();
+    const afterTxHandler = (tx: Y.Transaction) => {
+      if (tx.origin === CHECKOUT_ORIGIN) {
+        this.clearAll();
+      }
     };
-    this.doc.on("update", this.onUpdate);
+    this.doc.on('afterTransaction', afterTxHandler);
+    this.unbindTx = () => {
+      this.doc.off('afterTransaction', afterTxHandler);
+    };
   }
 
-  get canUndo(): boolean {
-    return this.manager.canUndo();
+  private getManager(path: string): Y.UndoManager | null {
+    const yText = this.filesMap.get(path);
+    if (!yText) {
+      this.undoManagers.delete(path);
+      return null;
+    }
+
+    let manager = this.undoManagers.get(path);
+    if (!manager) {
+      manager = new Y.UndoManager(yText, {
+        trackedOrigins: new Set([LOCAL_EDIT_ORIGIN]),
+        captureTimeout: 350,
+      });
+      this.undoManagers.set(path, manager);
+    }
+    return manager;
   }
 
-  get canRedo(): boolean {
-    return this.manager.canRedo();
+  undo(path: string): boolean {
+    const manager = this.getManager(path);
+    if (!manager || !manager.canUndo()) return false;
+    manager.undo();
+    return true;
   }
 
-  undo(): void {
-    this.manager.undo();
+  redo(path: string): boolean {
+    const manager = this.getManager(path);
+    if (!manager || !manager.canRedo()) return false;
+    manager.redo();
+    return true;
   }
 
-  redo(): void {
-    this.manager.redo();
+  canUndo(path: string): boolean {
+    return this.getManager(path)?.canUndo() ?? false;
   }
 
-  clear(): void {
-    this.manager.clear();
+  canRedo(path: string): boolean {
+    return this.getManager(path)?.canRedo() ?? false;
+  }
+
+  clearFile(path: string): void {
+    const manager = this.undoManagers.get(path);
+    if (manager) {
+      manager.clear();
+    }
+  }
+
+  clearAll(): void {
+    for (const manager of this.undoManagers.values()) {
+      manager.clear();
+    }
+    this.undoManagers.clear();
   }
 
   destroy(): void {
-    this.doc.off("update", this.onUpdate);
-    this.manager.destroy();
+    this.unbindTx();
+    for (const manager of this.undoManagers.values()) {
+      manager.destroy();
+    }
+    this.undoManagers.clear();
   }
 }

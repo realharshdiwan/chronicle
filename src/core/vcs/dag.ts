@@ -1,252 +1,117 @@
+import type { IObjectStorage } from '../cas/ObjectStore';
+import type { CommitObject } from '../types';
+
 /**
- * Merkle-DAG traversal and Lowest Common Ancestor search.
- *
- * All traversal is by parentHashes only; commit hashes are content addresses,
- * so the graph cannot contain forged ancestry without breaking CAS integrity.
+ * Loads a commit object from storage, returning null if missing or non-commit.
  */
-
-import type { IObjectStorage } from "../cas/ObjectStore";
-import type { CommitObject, Sha256Hash } from "../types";
-import {
-  DagIntegrityError,
-  MissingObjectError,
-  UnexpectedObjectTypeError,
-} from "./errors";
-
-export interface CommitHistoryOptions {
-  /** Return at most this many commits, newest first. */
-  limit?: number;
-}
-
-type CommitCache = Map<Sha256Hash, CommitObject>;
-
-async function loadCommit(
+async function getCommit(
   storage: IObjectStorage,
-  hash: Sha256Hash,
-  cache: CommitCache,
-): Promise<CommitObject> {
-  const cached = cache.get(hash);
-  if (cached) return cached;
-
-  const object = await storage.getObject(hash);
-  if (!object) throw new MissingObjectError(hash, "commit");
-  if (object.type !== "commit") {
-    throw new UnexpectedObjectTypeError(hash, "commit", object.type);
-  }
-
-  cache.set(hash, object);
-  return object;
-}
-
-/** Loads one commit, validating its type. */
-export async function getCommit(
-  storage: IObjectStorage,
-  hash: Sha256Hash,
-): Promise<CommitObject> {
-  return loadCommit(storage, hash, new Map());
+  hash: string
+): Promise<CommitObject | null> {
+  const obj = await storage.getObject(hash);
+  if (!obj || obj.type !== 'commit') return null;
+  return obj;
 }
 
 /**
- * Walks the ancestor graph rooted at `startHash` and returns a deterministic
- * topological order, newest first. Every commit appears before each of its
- * parents, including across merge edges.
- *
- * The implementation uses an iterative DFS post-order followed by a reversal
- * (a standard O(V+E) topological sort) rather than recursion, so very deep
- * histories cannot overflow the JS stack.
+ * Iterative topological / reverse-chronological history traversal from given starting hashes.
  */
 export async function getCommitHistory(
   storage: IObjectStorage,
-  startHash: Sha256Hash,
-  options: CommitHistoryOptions = {},
+  startHashes: string[],
+  limit?: number
 ): Promise<CommitObject[]> {
-  const limit = options.limit;
-  if (limit !== undefined && (!Number.isFinite(limit) || limit <= 0)) return [];
+  const commits = new Map<string, CommitObject>();
+  const queue = [...startHashes];
+  const visited = new Set<string>();
 
-  const cache: CommitCache = new Map();
-  const visited = new Set<Sha256Hash>();
-  const postorder: CommitObject[] = [];
-  const stack: Array<{ hash: Sha256Hash; expanded: boolean }> = [
-    { hash: startHash, expanded: false },
-  ];
+  while (queue.length > 0) {
+    const hash = queue.shift()!;
+    if (visited.has(hash)) continue;
+    visited.add(hash);
 
-  while (stack.length > 0) {
-    const frame = stack.pop();
-    if (!frame) break;
+    const commit = await getCommit(storage, hash);
+    if (!commit) continue;
 
-    if (frame.expanded) {
-      const commit = cache.get(frame.hash);
-      if (commit) postorder.push(commit);
-      continue;
-    }
-
-    if (visited.has(frame.hash)) continue;
-    visited.add(frame.hash);
-
-    const commit = await loadCommit(storage, frame.hash, cache);
-    stack.push({ hash: frame.hash, expanded: true });
-    // Pushing parents in natural order means the first parent is expanded
-    // first after the reversal, matching Git's first-parent-first intuition.
+    commits.set(hash, commit);
     for (const parentHash of commit.parentHashes) {
       if (!visited.has(parentHash)) {
-        stack.push({ hash: parentHash, expanded: false });
+        queue.push(parentHash);
       }
     }
   }
 
-  postorder.reverse();
-
-  if (limit !== undefined) return postorder.slice(0, Math.floor(limit));
-  return postorder;
-}
-
-/**
- * Bidirectional BFS over ancestor generations.
- *
- * Both sides advance one generation at a time, recording each ancestor's
- * shortest distance from its starting commit. Intersections are candidate
- * common ancestors; candidates that are themselves ancestors of another
- * candidate are dominated and discarded. This handles criss-cross histories
- * where simply taking the first intersection can return a commit that is
- * older than the true merge base.
- */
-async function ancestorDistances(
-  storage: IObjectStorage,
-  startHash: Sha256Hash,
-  cache: CommitCache,
-): Promise<Map<Sha256Hash, number>> {
-  const distances = new Map<Sha256Hash, number>([[startHash, 0]]);
-  let frontier: Sha256Hash[] = [startHash];
-  let depth = 0;
-
-  while (frontier.length > 0) {
-    depth += 1;
-    const next: Sha256Hash[] = [];
-
-    for (const hash of frontier) {
-      const commit = await loadCommit(storage, hash, cache);
-      for (const parentHash of commit.parentHashes) {
-        if (!distances.has(parentHash)) {
-          distances.set(parentHash, depth);
-          next.push(parentHash);
-        }
-      }
-    }
-
-    frontier = next;
+  // Kahn's topological sort biased toward newest timestamp first
+  const childrenCount = new Map<string, number>();
+  for (const hash of commits.keys()) {
+    childrenCount.set(hash, 0);
   }
-
-  return distances;
-}
-
-async function ancestorHashes(
-  storage: IObjectStorage,
-  startHash: Sha256Hash,
-  cache: CommitCache,
-): Promise<Set<Sha256Hash>> {
-  const visited = new Set<Sha256Hash>([startHash]);
-  const stack: Sha256Hash[] = [startHash];
-
-  while (stack.length > 0) {
-    const hash = stack.pop();
-    if (!hash) break;
-    const commit = await loadCommit(storage, hash, cache);
+  for (const commit of commits.values()) {
     for (const parentHash of commit.parentHashes) {
-      if (!visited.has(parentHash)) {
-        visited.add(parentHash);
-        stack.push(parentHash);
+      if (commits.has(parentHash)) {
+        childrenCount.set(parentHash, (childrenCount.get(parentHash) ?? 0) + 1);
       }
     }
   }
 
-  return visited;
-}
-
-/**
- * Returns the best common ancestor of two commits, or null when their
- * histories are unrelated. Multiple "best" candidates (criss-cross merges)
- * are ranked deterministically by proximity, then recency, then hash.
- */
-export async function findLCA(
-  storage: IObjectStorage,
-  commitA: Sha256Hash,
-  commitB: Sha256Hash,
-): Promise<CommitObject | null> {
-  const cache: CommitCache = new Map();
-  const [distancesA, distancesB] = await Promise.all([
-    ancestorDistances(storage, commitA, cache),
-    ancestorDistances(storage, commitB, cache),
-  ]);
-
-  const candidates = [...distancesA.keys()].filter((hash) =>
-    distancesB.has(hash),
-  );
-  if (candidates.length === 0) return null;
-
-  const candidateSet = new Set(candidates);
-  const dominated = new Set<Sha256Hash>();
-
-  for (const candidate of candidates) {
-    const ancestors = await ancestorHashes(storage, candidate, cache);
-    for (const ancestor of ancestors) {
-      if (ancestor !== candidate && candidateSet.has(ancestor)) {
-        dominated.add(ancestor);
-      }
+  const ready: CommitObject[] = [];
+  for (const [hash, count] of childrenCount.entries()) {
+    if (count === 0) {
+      const c = commits.get(hash);
+      if (c) ready.push(c);
     }
   }
 
-  const best = candidates.filter((hash) => !dominated.has(hash));
-  const ranked: Array<{
-    commit: CommitObject;
-    maxDepth: number;
-    sumDepth: number;
-  }> = [];
-
-  for (const hash of best) {
-    const commit = await loadCommit(storage, hash, cache);
-    const distanceA = distancesA.get(hash) ?? Number.POSITIVE_INFINITY;
-    const distanceB = distancesB.get(hash) ?? Number.POSITIVE_INFINITY;
-    ranked.push({
-      commit,
-      maxDepth: Math.max(distanceA, distanceB),
-      sumDepth: distanceA + distanceB,
+  const ordered: CommitObject[] = [];
+  while (ready.length > 0) {
+    ready.sort((a, b) => {
+      if (b.timestamp !== a.timestamp) return b.timestamp - a.timestamp;
+      return a.hash.localeCompare(b.hash);
     });
+
+    const current = ready.shift()!;
+    ordered.push(current);
+    if (limit !== undefined && ordered.length >= limit) {
+      return ordered;
+    }
+
+    for (const parentHash of current.parentHashes) {
+      if (!commits.has(parentHash)) continue;
+      const nextCount = (childrenCount.get(parentHash) ?? 0) - 1;
+      childrenCount.set(parentHash, nextCount);
+      if (nextCount === 0) {
+        const parent = commits.get(parentHash);
+        if (parent) ready.push(parent);
+      }
+    }
   }
 
-  ranked.sort((left, right) => {
-    if (left.maxDepth !== right.maxDepth) return left.maxDepth - right.maxDepth;
-    if (left.sumDepth !== right.sumDepth) return left.sumDepth - right.sumDepth;
-    if (left.commit.timestamp !== right.commit.timestamp) {
-      return right.commit.timestamp - left.commit.timestamp;
-    }
-    return left.commit.hash < right.commit.hash ? -1 : 1;
-  });
-
-  return ranked[0]?.commit ?? null;
+  return ordered;
 }
 
-/** True when `ancestorHash` is reachable by following parents from `descendantHash`. */
+/**
+ * Checks whether ancestorHash is reachable by walking parent pointers from descendantHash.
+ */
 export async function isAncestor(
   storage: IObjectStorage,
-  ancestorHash: Sha256Hash,
-  descendantHash: Sha256Hash,
+  ancestorHash: string,
+  descendantHash: string
 ): Promise<boolean> {
   if (ancestorHash === descendantHash) return true;
+  const visited = new Set<string>();
+  const queue: string[] = [descendantHash];
 
-  const cache: CommitCache = new Map();
-  const visited = new Set<Sha256Hash>([descendantHash]);
-  const stack: Sha256Hash[] = [descendantHash];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (current === ancestorHash) return true;
+    if (visited.has(current)) continue;
+    visited.add(current);
 
-  while (stack.length > 0) {
-    const hash = stack.pop();
-    if (!hash) break;
-    const commit = await loadCommit(storage, hash, cache);
-
+    const commit = await getCommit(storage, current);
+    if (!commit) continue;
     for (const parentHash of commit.parentHashes) {
-      if (parentHash === ancestorHash) return true;
       if (!visited.has(parentHash)) {
-        visited.add(parentHash);
-        stack.push(parentHash);
+        queue.push(parentHash);
       }
     }
   }
@@ -254,23 +119,94 @@ export async function isAncestor(
   return false;
 }
 
-/**
- * Ensures the graph reachable from `startHash` is closed: every parent link
- * resolves to a commit. Useful before rendering the DAG in the X-Ray drawer.
- */
-export async function assertCompleteHistory(
+async function computeAncestorDistances(
   storage: IObjectStorage,
-  startHash: Sha256Hash,
-): Promise<void> {
-  const commits = await getCommitHistory(storage, startHash);
-  const seen = new Set(commits.map((commit) => commit.hash));
-  for (const commit of commits) {
+  startHash: string
+): Promise<Map<string, number>> {
+  const distances = new Map<string, number>();
+  const queue: Array<{ hash: string; dist: number }> = [
+    { hash: startHash, dist: 0 },
+  ];
+
+  while (queue.length > 0) {
+    const { hash, dist } = queue.shift()!;
+    const prev = distances.get(hash);
+    if (prev !== undefined && prev <= dist) continue;
+    distances.set(hash, dist);
+
+    const commit = await getCommit(storage, hash);
+    if (!commit) continue;
     for (const parentHash of commit.parentHashes) {
-      if (!seen.has(parentHash)) {
-        throw new DagIntegrityError(
-          `Commit ${commit.hash.slice(0, 12)}… references missing parent ${parentHash.slice(0, 12)}…`,
-        );
+      queue.push({ hash: parentHash, dist: dist + 1 });
+    }
+  }
+
+  return distances;
+}
+
+/**
+ * Deterministic Lowest Common Ancestor (LCA) via bidirectional BFS with
+ * dominance filtering (removing candidates that are strict ancestors of other candidates)
+ * and deterministic ranking (total distance -> recency -> hash).
+ */
+export async function findLCA(
+  storage: IObjectStorage,
+  commitA: string,
+  commitB: string
+): Promise<string | null> {
+  if (commitA === commitB) return commitA;
+
+  const [distA, distB] = await Promise.all([
+    computeAncestorDistances(storage, commitA),
+    computeAncestorDistances(storage, commitB),
+  ]);
+
+  const commonHashes: string[] = [];
+  for (const hash of distA.keys()) {
+    if (distB.has(hash)) {
+      commonHashes.push(hash);
+    }
+  }
+
+  if (commonHashes.length === 0) return null;
+
+  // Dominance filtering: discard any common ancestor X that is a strict ancestor of another common ancestor Y
+  const dominated = new Set<string>();
+  for (let i = 0; i < commonHashes.length; i++) {
+    const candidate = commonHashes[i];
+    if (dominated.has(candidate)) continue;
+    for (let j = 0; j < commonHashes.length; j++) {
+      if (i === j) continue;
+      const other = commonHashes[j];
+      if (dominated.has(other)) continue;
+      if (await isAncestor(storage, candidate, other)) {
+        dominated.add(candidate);
+        break;
       }
     }
   }
+
+  const maximal = commonHashes.filter((h) => !dominated.has(h));
+  if (maximal.length === 1) return maximal[0];
+
+  // Deterministic tie-breaker for criss-cross merges: total distance -> timestamp -> hash
+  const scored = await Promise.all(
+    maximal.map(async (hash) => {
+      const commit = await getCommit(storage, hash);
+      const totalDist = (distA.get(hash) ?? 0) + (distB.get(hash) ?? 0);
+      return {
+        hash,
+        totalDist,
+        timestamp: commit?.timestamp ?? 0,
+      };
+    })
+  );
+
+  scored.sort((a, b) => {
+    if (a.totalDist !== b.totalDist) return a.totalDist - b.totalDist;
+    if (b.timestamp !== a.timestamp) return b.timestamp - a.timestamp;
+    return a.hash.localeCompare(b.hash);
+  });
+
+  return scored[0]?.hash ?? null;
 }

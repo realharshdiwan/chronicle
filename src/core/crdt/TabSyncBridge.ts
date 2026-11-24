@@ -1,254 +1,174 @@
-/**
- * Cross-tab CRDT relay over native `BroadcastChannel`.
- *
- * Protocol:
- *   - `SYNC_STEP_1` carries `Y.encodeStateVector(ydoc)`.
- *   - `SYNC_STEP_2` carries `Y.encodeStateAsUpdate(ydoc, remoteVector)`, the
- *     exact missing delta for the requester.
- *   - `update` carries incremental local edits.
- *   - `branch` carries active-branch change notifications for UI mirroring.
- *
- * Every remote update is applied with the `"broadcast"` origin. The local
- * update listener ignores `"broadcast"` and y-indexeddb origins, so received
- * state and IndexedDB replays are never echoed back onto the channel.
- */
-
-import { applyUpdate, encodeStateAsUpdate, encodeStateVector } from "yjs";
-import type { Doc } from "yjs";
-
-export const DEFAULT_SYNC_CHANNEL = "chronicle-crdt-sync";
-
-/** Origin attached to every update received from another tab. */
-export const BROADCAST_ORIGIN = "broadcast";
-
-export interface SyncStep1Message {
-  type: "SYNC_STEP_1";
-  stateVector: Uint8Array;
-}
-
-export interface SyncStep2Message {
-  type: "SYNC_STEP_2";
-  update: Uint8Array;
-}
-
-export interface SyncUpdateMessage {
-  type: "update";
-  update: Uint8Array;
-}
-
-export interface SyncBranchMessage {
-  type: "branch";
-  branch: string | null;
-}
+import * as Y from 'yjs';
+import type { ISyncTransport } from '../types';
+import { BROADCAST_ORIGIN, PERSISTENCE_ORIGIN } from './origins';
 
 export type SyncMessage =
-  | SyncStep1Message
-  | SyncStep2Message
-  | SyncUpdateMessage
-  | SyncBranchMessage;
+  | { type: 'SYNC_STEP_1'; senderId: string; stateVector: number[] }
+  | { type: 'SYNC_STEP_2'; senderId: string; update: number[] }
+  | { type: 'UPDATE'; senderId: string; update: number[] }
+  | { type: 'BRANCH_CHANGE'; senderId: string; branch: string; commitHash: string };
 
-/** Structural subset of BroadcastChannel, injectable in tests. */
-export interface SyncChannel {
-  postMessage(message: unknown): void;
-  addEventListener(
-    type: "message",
-    listener: (event: MessageEvent<unknown>) => void,
-  ): void;
-  removeEventListener(
-    type: "message",
-    listener: (event: MessageEvent<unknown>) => void,
-  ): void;
-  close(): void;
+export class BroadcastChannelTransport implements ISyncTransport {
+  private channel: BroadcastChannel;
+
+  constructor(channelName = 'chronicle-crdt-sync') {
+    this.channel = new BroadcastChannel(channelName);
+  }
+
+  send(message: unknown): void {
+    this.channel.postMessage(message);
+  }
+
+  subscribe(handler: (message: unknown) => void): () => void {
+    const listener = (event: MessageEvent) => {
+      handler(event.data);
+    };
+    this.channel.addEventListener('message', listener);
+    return () => {
+      this.channel.removeEventListener('message', listener);
+    };
+  }
+
+  close(): void {
+    this.channel.close();
+  }
 }
 
 export interface TabSyncBridgeOptions {
-  /** Channel name; defaults to `chronicle-crdt-sync`. */
+  transport?: ISyncTransport;
   channelName?: string;
-  /** Inject a channel (tests, workers, or a custom transport). */
-  channel?: SyncChannel;
-  /** The y-indexeddb instance whose replays must not be re-broadcast. */
-  persistence?: unknown;
-  /**
-   * Wait for local persistence before announcing the state vector. Prevents a
-   * fresh tab from answering a handshake with an empty, not-yet-hydrated doc.
-   */
-  ready?: Promise<unknown>;
-  /** Tests can disable the automatic startup handshake. */
-  autoStart?: boolean;
-  /** Notified when another tab announces a branch change. */
-  onBranchChange?: (branch: string | null) => void;
-}
-
-function toUint8Array(value: unknown): Uint8Array | null {
-  if (value instanceof Uint8Array) return value;
-  if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  return null;
-}
-
-function parseMessage(value: unknown): SyncMessage | null {
-  if (typeof value !== "object" || value === null) return null;
-
-  const message = value as Record<string, unknown>;
-
-  switch (message.type) {
-    case "SYNC_STEP_1": {
-      const stateVector = toUint8Array(message.stateVector);
-      return stateVector ? { type: "SYNC_STEP_1", stateVector } : null;
-    }
-    case "SYNC_STEP_2": {
-      const update = toUint8Array(message.update);
-      return update ? { type: "SYNC_STEP_2", update } : null;
-    }
-    case "update": {
-      const update = toUint8Array(message.update);
-      return update ? { type: "update", update } : null;
-    }
-    case "branch":
-      return {
-        type: "branch",
-        branch: typeof message.branch === "string" ? message.branch : null,
-      };
-    default:
-      return null;
-  }
+  onBranchChange?: (branch: string, commitHash: string) => void;
+  onPeerSync?: (peerId: string) => void;
 }
 
 export class TabSyncBridge {
-  readonly doc: Doc;
-  readonly channel: SyncChannel;
-  readonly channelName: string;
+  readonly tabId: string;
+  private doc: Y.Doc;
+  private transport: ISyncTransport | null = null;
+  private unsubTransport: (() => void) | null = null;
+  private onBranchChange?: (branch: string, commitHash: string) => void;
+  private onPeerSync?: (peerId: string) => void;
+  private peers = new Set<string>();
 
-  private readonly persistenceOrigin: unknown;
-  private readonly onBranchChange: ((branch: string | null) => void) | null;
-  private readonly ready: Promise<void> | null;
-  private started = false;
-  private readyResolved = false;
-  private destroyed = false;
-  private pendingMessages: SyncMessage[] = [];
-  private activeBranch: string | null = null;
-
-  constructor(doc: Doc, options: TabSyncBridgeOptions = {}) {
+  constructor(doc: Y.Doc, options: TabSyncBridgeOptions = {}) {
     this.doc = doc;
-    this.channelName = options.channelName ?? DEFAULT_SYNC_CHANNEL;
-    this.channel = options.channel ?? new BroadcastChannel(this.channelName);
-    this.persistenceOrigin = options.persistence ?? null;
-    this.onBranchChange = options.onBranchChange ?? null;
-    this.ready = options.ready
-      ? Promise.resolve(options.ready).then(() => undefined)
-      : null;
+    this.tabId =
+      typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        ? crypto.randomUUID()
+        : `tab-${Math.random().toString(36).slice(2, 10)}`;
+    this.onBranchChange = options.onBranchChange;
+    this.onPeerSync = options.onPeerSync;
 
-    this.doc.on("update", this.onDocUpdate);
-    this.channel.addEventListener("message", this.onChannelMessage);
+    if (options.transport) {
+      this.transport = options.transport;
+    } else if (typeof BroadcastChannel !== 'undefined') {
+      this.transport = new BroadcastChannelTransport(
+        options.channelName ?? 'chronicle-crdt-sync'
+      );
+    }
 
-    if (options.autoStart !== false) void this.start();
+    if (this.transport) {
+      this.unsubTransport = this.transport.subscribe((raw) =>
+        this.handleMessage(raw as SyncMessage)
+      );
+      this.doc.on('update', this.handleLocalDocUpdate);
+      this.initiateHandshake();
+    }
   }
 
-  /** Branch last announced by another tab (or by this bridge locally). */
-  get activeBranchName(): string | null {
-    return this.activeBranch;
+  getPeerCount(): number {
+    return this.peers.size;
   }
 
-  /**
-   * Begins the handshake: waits for local persistence, replays any messages
-   * queued during startup, then asks peers for everything this doc is missing.
-   */
-  async start(): Promise<void> {
-    if (this.started || this.destroyed) return;
-    this.started = true;
-
-    if (this.ready) await this.ready;
-    if (this.destroyed) return;
-
-    this.readyResolved = true;
-    const pending = this.pendingMessages;
-    this.pendingMessages = [];
-    for (const message of pending) this.handleMessage(message);
-
-    this.postSyncStep1();
+  initiateHandshake(): void {
+    if (!this.transport) return;
+    const sv = Y.encodeStateVector(this.doc);
+    this.transport.send({
+      type: 'SYNC_STEP_1',
+      senderId: this.tabId,
+      stateVector: Array.from(sv),
+    } satisfies SyncMessage);
   }
 
-  /** Re-sends `SYNC_STEP_1` after startup (e.g. after a reconnect). */
-  requestSync(): void {
-    if (!this.readyResolved || this.destroyed) return;
-    this.postSyncStep1();
-  }
-
-  /** Relays an active-branch change to every other open tab. */
-  broadcastBranchChange(branch: string | null): void {
-    this.activeBranch = branch;
-    if (this.destroyed) return;
-    this.channel.postMessage({
-      type: "branch",
+  broadcastBranchChange(branch: string, commitHash: string): void {
+    if (!this.transport) return;
+    this.transport.send({
+      type: 'BRANCH_CHANGE',
+      senderId: this.tabId,
       branch,
-    } satisfies SyncBranchMessage);
+      commitHash,
+    } satisfies SyncMessage);
   }
 
-  /** Detaches listeners and closes the channel. */
-  stop(): void {
-    if (this.destroyed) return;
-    this.destroyed = true;
-    this.doc.off("update", this.onDocUpdate);
-    this.channel.removeEventListener("message", this.onChannelMessage);
-    this.channel.close();
-    this.pendingMessages = [];
-  }
+  private handleLocalDocUpdate = (update: Uint8Array, origin: unknown): void => {
+    // Origin guards: never re-broadcast remote updates or IndexedDB hydration
+    if (
+      origin === BROADCAST_ORIGIN ||
+      origin === PERSISTENCE_ORIGIN ||
+      origin === this
+    ) {
+      return;
+    }
+    this.transport?.send({
+      type: 'UPDATE',
+      senderId: this.tabId,
+      update: Array.from(update),
+    } satisfies SyncMessage);
+  };
 
-  private postSyncStep1(): void {
-    this.channel.postMessage({
-      type: "SYNC_STEP_1",
-      stateVector: encodeStateVector(this.doc),
-    } satisfies SyncStep1Message);
-  }
-
-  private readonly onDocUpdate = (update: Uint8Array, origin: unknown): void => {
-    if (this.destroyed) return;
-
-    // Never echo remote or persisted state back onto the channel.
-    if (origin === BROADCAST_ORIGIN || origin === this) return;
-    if (this.persistenceOrigin !== null && origin === this.persistenceOrigin) {
+  private handleMessage(msg: SyncMessage): void {
+    if (!msg || typeof msg !== 'object' || msg.senderId === this.tabId) {
       return;
     }
 
-    this.channel.postMessage({
-      type: "update",
-      update,
-    } satisfies SyncUpdateMessage);
-  };
+    this.peers.add(msg.senderId);
+    this.onPeerSync?.(msg.senderId);
 
-  private readonly onChannelMessage = (
-    event: MessageEvent<unknown>,
-  ): void => {
-    if (this.destroyed) return;
+    switch (msg.type) {
+      case 'SYNC_STEP_1': {
+        const remoteSV = new Uint8Array(msg.stateVector);
+        const diffUpdate = Y.encodeStateAsUpdate(this.doc, remoteSV);
+        this.transport?.send({
+          type: 'SYNC_STEP_2',
+          senderId: this.tabId,
+          update: Array.from(diffUpdate),
+        } satisfies SyncMessage);
 
-    const message = parseMessage(event.data);
-    if (!message) return;
-
-    if (!this.readyResolved) {
-      this.pendingMessages.push(message);
-      return;
-    }
-
-    this.handleMessage(message);
-  };
-
-  private handleMessage(message: SyncMessage): void {
-    switch (message.type) {
-      case "SYNC_STEP_1": {
-        const update = encodeStateAsUpdate(this.doc, message.stateVector);
-        this.channel.postMessage({
-          type: "SYNC_STEP_2",
-          update,
-        } satisfies SyncStep2Message);
+        // Also request missing updates from the peer
+        const localSV = Y.encodeStateVector(this.doc);
+        const responseUpdate = Y.encodeStateAsUpdate(this.doc, remoteSV);
+        if (responseUpdate.byteLength === 0) {
+          this.transport?.send({
+            type: 'SYNC_STEP_2',
+            senderId: this.tabId,
+            update: Array.from(Y.encodeStateAsUpdate(this.doc)),
+          } satisfies SyncMessage);
+        }
+        void localSV;
         break;
       }
-      case "SYNC_STEP_2":
-      case "update":
-        applyUpdate(this.doc, message.update, BROADCAST_ORIGIN);
+
+      case 'SYNC_STEP_2':
+      case 'UPDATE': {
+        const updateBytes = new Uint8Array(msg.update);
+        if (updateBytes.byteLength > 0) {
+          Y.applyUpdate(this.doc, updateBytes, BROADCAST_ORIGIN);
+        }
         break;
-      case "branch":
-        this.activeBranch = message.branch;
-        this.onBranchChange?.(message.branch);
+      }
+
+      case 'BRANCH_CHANGE': {
+        this.onBranchChange?.(msg.branch, msg.commitHash);
         break;
+      }
     }
+  }
+
+  destroy(): void {
+    this.doc.off('update', this.handleLocalDocUpdate);
+    this.unsubTransport?.();
+    this.transport?.close();
+    this.unsubTransport = null;
+    this.transport = null;
   }
 }
