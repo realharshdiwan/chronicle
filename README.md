@@ -161,14 +161,14 @@ Search across historical commit snapshots without decompressing the entire datab
 
 ## Benchmarks
 
-Micro-benchmarks run against memory-backed stores simulating client environments:
+Micro-benchmarks run across all four core subsystems in headless isolation using `bun run bench`:
 
-| Benchmark Operation | Workload / Configuration | Mean Latency | Throughput |
-| :--- | :--- | :---: | :---: |
-| **Sequential CRDT Keystrokes** | 1,000 character inserts into one `Y.Text` (`LOCAL_EDIT_ORIGIN`) | **1.94 ms** | **516 ops/s** |
-| **SHA-256 Tree Hashing** | 100 blobs → 1 tree object (Canonical JSON + Web Crypto SHA-256) | **1.67 ms** | **600 ops/s** |
-| **LCA + 3-Way Merge (50-Commit DAG)** | 30 `main` + 20 `feature` commits with overlapping edits | **0.38 ms** | **2,611 ops/s** |
-| **Full Inverted Index Token Sync** | 25 multi-paragraph Markdown files tokenized & indexed | **4.20 ms** | **238 ops/s** |
+| Benchmark Subsystem | Workload / Configuration | p50 | p95 | Mean Latency | Throughput | Notes |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| **CRDT Working Tree** | 1,000 sequential inserts/deletes in `WorkingTreeDoc` + state vector | **2.41 ms** | **3.75 ms** | **2.57 ms** | **390 ops/s** | Zero-persistence CRDT |
+| **Content-Addressable Storage** | SHA-256 blob & tree hashing (50-file workspace) | **1.02 ms** | **1.60 ms** | **1.05 ms** | **954 ops/s** | 1.08x Deduplication |
+| **Merkle-DAG & 3-Way Merge** | Bidirectional BFS LCA + 3-way merge across 50-commit DAG | **0.26 ms** | **0.43 ms** | **0.28 ms** | **3,546 ops/s** | Myers diff3 resolution |
+| **Local Full-Text Search** | Indexing & querying 100 Markdown documents in `SearchIndex` | **6.00 ms** | **7.63 ms** | **6.14 ms** | **163 ops/s** | Inverted B-Tree tokens |
 
 ---
 
@@ -232,13 +232,16 @@ Open `http://localhost:3000` (or the port Vite prints). The first load seeds an 
 
 ```bash
 # Run the complete test suite (28 core unit tests across all distributed modules)
-npm test
+bun test
+
+# Run the 4-subsystem reproducible micro-benchmark suite
+bun run bench
 
 # Type-check TypeScript sources
-npm run lint
+bun run lint
 
 # Compile production PWA static bundle
-npm run build
+bun run build
 ```
 
 ---

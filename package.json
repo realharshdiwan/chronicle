@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "test": "tsx --test src/core/**/*.test.ts src/utils/*.test.ts"
+    "test": "tsx --test src/core/**/*.test.ts src/utils/*.test.ts",
+    "bench": "bun run benchmarks/runBench.ts"
   },
   "dependencies": {
     "@codemirror/commands": "^6.11.1",
