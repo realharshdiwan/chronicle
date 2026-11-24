@@ -78,11 +78,11 @@ flowchart TB
         Registry["WorkspaceRegistry\n(Isolated DB namespaces & author config)"]
     end
 
-    Editor -->|Y.Text edits| Tree
-    Editor -->|keymap| Undo
-    Tree -.->|ydoc.transact('checkout')| Bridge
-    Bridge -.->|BroadcastChannel('chronicle-crdt-sync')| Tree
-    Tree -.->|y-indexeddb| CAS
+    Editor -->|"Y.Text edits"| Tree
+    Editor -->|"keymap"| Undo
+    Tree -.->|"checkout transaction"| Bridge
+    Bridge -.->|"BroadcastChannel sync"| Tree
+    Tree -.->|"persistence"| CAS
     Actions --> Repo
     Repo --> CAS
     Repo --> Tree
